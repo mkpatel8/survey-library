@@ -40,3 +40,994 @@
   }
 }
 
+
+This is the classic tab synchronization issue with web applications. Let me explain what's happening:
+
+When Tab 1 loads initially as Plan Member, it has:
+1. The Plan Member's interface rendered in the HTML
+2. JavaScript that might reference the Plan Member role
+3. The page's state is built assuming Plan Member permissions
+
+Even though you logged out in Tab 2 and the authentication cookies now reflect Plan Admin, Tab 1 doesn't automatically know about this change until it makes a new server request.
+
+When you click within Tab 1, one of these behaviors might occur:
+1. Client-side navigation that doesn't hit the server (stays with Plan Member view)
+2. AJAX calls that include the new Plan Admin cookies but the UI remains Plan Member
+3. Some server calls that validate authentication but don't force a full page refresh
+
+To fix this specific case, we need to detect user changes across tabs. Here's a solution:
+
+```csharp
+public class UserSwitchDetectionModule : IHttpModule
+{
+    public void Init(HttpApplication context)
+    {
+        context.PreRequestHandlerExecute += OnPreRequestHandlerExecute;
+    }
+
+    private void OnPreRequestHandlerExecute(object sender, EventArgs e)
+    {
+        var app = sender as HttpApplication;
+        if (app == null) return;
+
+        // Skip for API calls, static resources, etc.
+        if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path.ToLowerInvariant()))
+            return;
+
+        // Skip for unauthenticated requests
+        if (app.Context.User == null || !app.Context.User.Identity.IsAuthenticated)
+            return;
+
+        var request = app.Context.Request;
+        var response = app.Context.Response;
+
+        // Get current user ID from authentication cookie
+        var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
+        if (authCookie == null) return;
+
+        try
+        {
+            var authCookieInfo = new AuthCookieInfo(authCookie);
+            var currentCookieUser = authCookieInfo.UserName;
+            
+            // Get currently rendered user from session
+            var lastKnownUser = app.Context.Session["LastKnownUserID"] as string;
+            
+            // If this is the first request in this session, store the user
+            if (string.IsNullOrEmpty(lastKnownUser))
+            {
+                app.Context.Session["LastKnownUserID"] = currentCookieUser;
+                return;
+            }
+            
+            // If user has changed, force a full page refresh to the same URL
+            if (lastKnownUser != currentCookieUser)
+            {
+                // Update session with new user
+                app.Context.Session["LastKnownUserID"] = currentCookieUser;
+                
+                // Only force reload for HTML requests (not AJAX or API)
+                if (!request.IsAjaxRequest() && 
+                    !request.Path.ToLowerInvariant().Contains("/api/"))
+                {
+                    // Redirect to same URL to force a complete page reload
+                    string currentUrl = request.Url.PathAndQuery;
+                    
+                    // Add or update a parameter to prevent browser caching
+                    string separator = currentUrl.Contains("?") ? "&" : "?";
+                    currentUrl += separator + "userChanged=" + DateTime.Now.Ticks;
+                    
+                    response.Redirect(currentUrl, false);
+                    app.CompleteRequest();
+                }
+                else
+                {
+                    // For AJAX requests, add a header that client code could detect
+                    response.Headers.Add("X-User-Changed", "true");
+                }
+            }
+        }
+        catch
+        {
+            // Continue with request if there's any error
+        }
+    }
+
+    public void Dispose() { }
+}
+```
+
+Register this module in your web.config:
+
+```xml
+<add name="UserSwitchDetectionModule" type="Equitable.EquitableHealth.Web.UserSwitchDetectionModule, Equitable.EquitableHealth.Web" />
+```
+
+**What this solution does:**
+
+1. Tracks the currently active user in session state
+2. Compares that to the user in the authentication cookie on each request
+3. If they're different (user switched in another tab), it forces a complete page reload
+4. For AJAX requests, it adds a special header the client could detect
+
+This ensures that when you switch from Plan Member to Plan Admin in one tab, other tabs will detect the change and reload with the correct permissions and interface.
+
+Additionally, you could consider adding a small JavaScript function to periodically check if the authentication has changed. Include this in your layout or master page:
+
+```javascript
+// Check user session every 30 seconds
+function checkUserSession() {
+    fetch('/api/session/check', { 
+        credentials: 'include',  // Include cookies
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(response => {
+        // If status indicates user change, reload the page
+        if (response.headers.get('X-User-Changed') === 'true') {
+            window.location.reload();
+        }
+    })
+    .catch(() => {
+        // Silently fail - will try again later
+    });
+    
+    setTimeout(checkUserSession, 30000); // Check every 30 seconds
+}
+
+// Start checking
+checkUserSession();
+```
+
+This approach gives you the most comprehensive solution for multi-tab synchronization while requiring minimal changes to your existing code.
+
+===========
+The order of HTTP modules is important since they process requests in sequence. For your authentication modules, the optimal order would be:
+
+1. **Auth0SessionModule** - Should run first to validate basic authentication state and handle redirects for unauthenticated requests
+2. **LogoutCookieModule** - Should run next to intercept and properly handle logout requests 
+3. **UserSwitchDetectionModule** - Should run after authentication is verified but before user identity is fully established
+4. **BMSSessionModule** - Should run last to set up the final user identity and update activity timestamps
+
+In your web.config, the modules section should look like this:
+
+```xml
+<httpModules>
+  <add name="SuppressFormsAuthRedirectModule" type="Equitable.EquitableHealth.Web.SuppressFormsAuthRedirectModule, Equitable.EquitableHealth.Web" />
+  <add name="Localization" type="Equitable.EquitableHealth.Web.LocalizationModule, Equitable.EquitableHealth.Web" />
+  <add name="Auth0SessionModule" type="Equitable.EquitableHealth.Web.Auth0SessionModule, Equitable.EquitableHealth.Web" />
+  <add name="LogoutCookieModule" type="Equitable.EquitableHealth.Web.LogoutCookieModule, Equitable.EquitableHealth.Web" />
+  <add name="UserSwitchDetectionModule" type="Equitable.EquitableHealth.Web.UserSwitchDetectionModule, Equitable.EquitableHealth.Web" />
+  <add name="BmsSession" type="Equitable.EquitableHealth.Web.BmsSessionModule, Equitable.EquitableHealth.Web" />
+  <add name="CustomErrors" type="Equitable.EquitableHealth.Web.ErrorModule, Equitable.EquitableHealth.Web" />
+</httpModules>
+```
+
+This order ensures:
+
+1. Auth0 authentication is verified first
+2. Logout handling is consistent
+3. User switches are detected before session state is finalized
+4. BMS session is updated last with the correct identity
+
+You should also make sure each module properly hooks into the right event in the ASP.NET pipeline:
+
+- Auth0SessionModule: PostAcquireRequestState, AuthenticateRequest
+- LogoutCookieModule: EndRequest (to catch all logout attempts)
+- UserSwitchDetectionModule: PreRequestHandlerExecute (after auth but before page execution)
+- BMSSessionModule: PostAuthorizeRequest (final identity setup)
+
+This ordering ensures a smooth flow of authentication processing and should handle all your edge cases correctly.
+==============
+This is an interesting issue with your mobile authentication flow. Let's analyze what's happening:
+
+1. Mobile app redirects to Auth0 login
+2. After login, mobile app calls `/Account/UserInfo` with a Bearer token
+3. `/Account/UserInfo` validates the token, calls `FormsAuthentication.SignIn()` and returns JSON
+4. Then the mobile app calls `DataController/Certificate` with the same Bearer token
+5. `AppAuthorize` recognizes the Bearer token and returns true
+6. But instead of proceeding to the Certificate endpoint, it redirects to Auth0's `/authorize` endpoint with the web application's client ID
+
+This suggests that while your initial Bearer token authentication in `UserInfo` is successful, something is causing the session to be invalidated or not properly maintained for the subsequent `Certificate` call.
+
+The main issue appears to be a mismatch between how you're handling Bearer token authentication across different endpoints. Here's what's likely happening:
+
+1. Your `AppAuthorize` attribute correctly detects the Bearer token and returns true
+2. But somewhere in the pipeline after that, another authentication check is failing
+3. This could be happening in one of your HTTP modules like `Auth0SessionModule` or `BmsSessionModule`
+
+Let's modify the `Auth0SessionModule` to better handle mobile token requests:
+
+```csharp
+private void OnPostAcquireRequestState(object sender, EventArgs e)
+{
+    var app = sender as HttpApplication;
+    if (app == null)
+        return;
+
+    var request = app.Context.Request;
+
+    if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()))
+        return;
+
+    // Check for Mobile token - ENHANCED MOBILE TOKEN HANDLING
+    if (!string.IsNullOrEmpty(request.Headers["Authorization"]))
+    {
+        var authHeader = request.Headers["Authorization"];
+        if (authHeader.StartsWith("Bearer"))
+        {
+            try {
+                // Verify we have a valid token
+                var token = authHeader.Substring("Bearer".Length).Trim();
+                var handler = new JwtSecurityTokenHandler();
+                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+                
+                if (jsonToken != null)
+                {
+                    // If token is valid, ensure we have proper user identity
+                    if (!app.Context.User.Identity.IsAuthenticated)
+                    {
+                        // Get email from token
+                        var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "name" || 
+                                                                         c.Type == "email")?.Value;
+                        
+                        if (!string.IsNullOrEmpty(email))
+                        {
+                            // Look up user
+                            var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
+                            string userId = bmsDbUow.Users.GetUserIdFromEmailAddress(email);
+                            
+                            if (!string.IsNullOrEmpty(userId))
+                            {
+                                // Set up user identity
+                                var identity = new GenericIdentity(userId, "Bearer");
+                                app.Context.User = new GenericPrincipal(identity, new string[0]);
+                            }
+                        }
+                    }
+                    
+                    // We have a valid token, skip further authentication checks
+                    log.Info("Mobile Bearer token authentication successful");
+                    return;
+                }
+            }
+            catch (Exception ex) {
+                log.Error("Error validating mobile token", ex);
+                // Continue with normal auth flow if token validation fails
+            }
+        }
+    }
+
+    // Regular authentication flow continues...
+}
+```
+
+Also modify `BmsSessionModule` to be more mobile-friendly:
+
+```csharp
+private void Application_PostAuthorizeRequest(object source, EventArgs e)
+{
+    const string legacyThrottleDateFormat = "MM/dd/yyyy HH:mm:ss";
+    var app = source as HttpApplication;
+    if (app == null) return;
+
+    // Check for Mobile token with improved handling
+    var authHeader = app.Context.Request.Headers["Authorization"];
+    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer"))
+    {
+        log.Info("BmsSessionModule - Authorization header detected");
+        
+        // For mobile requests, make sure user identity is set up
+        if (app.Context.User?.Identity?.IsAuthenticated != true)
+        {
+            try {
+                // Parse token to get user info
+                var token = authHeader.Substring("Bearer".Length).Trim();
+                var handler = new JwtSecurityTokenHandler();
+                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+                
+                if (jsonToken != null)
+                {
+                    var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "name" || 
+                                                                     c.Type == "email")?.Value;
+                    
+                    if (!string.IsNullOrEmpty(email))
+                    {
+                        // Look up user
+                        var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
+                        string userId = bmsDbUow.Users.GetUserIdFromEmailAddress(email);
+                        
+                        if (!string.IsNullOrEmpty(userId))
+                        {
+                            // Get user roles
+                            var userProfileRoles = bmsDbUow.Users.GetProfileRoles(userId);
+                            
+                            // Set up identity with roles
+                            var identity = new GenericIdentity(userId, "Bearer");
+                            app.Context.User = new GenericPrincipal(identity, userProfileRoles.WebRoles);
+                            
+                            log.Info($"BmsSessionModule - Set up user identity for mobile user: {userId}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) {
+                log.Error("Error setting up mobile user identity", ex);
+            }
+        }
+        
+        return;
+    }
+    
+    // Regular web authentication flow continues...
+}
+```
+
+These changes ensure that:
+1. Both modules consistently recognize and validate the Bearer token
+2. They set up proper user identity for mobile requests
+3. They avoid redirecting mobile requests with valid tokens to Auth0 login
+
+This should prevent the mobile flow from getting redirected to the Auth0 login page when calling the Certificate endpoint. The key is making sure that every part of your authentication pipeline properly recognizes and handles Bearer tokens.
+
+=============
+# Authentication Flow Documentation for Auth0 Integration
+
+## Overview
+
+This document explains the authentication flow in the EHealth application after integrating Auth0. The system handles both web and mobile authentication paths while maintaining compatibility with legacy FormsAuthentication.
+
+## Key Components
+
+1. **Auth0SessionModule** - First-line authentication validation
+2. **LogoutCookieModule** - Manages logout operations consistently
+3. **UserSwitchDetectionModule** - Detects user changes across tabs
+4. **BMSSessionModule** - Manages user identity and session activity
+5. **FormsAuthentication** - Creates and manages auth tickets
+6. **AccountController** - Handles login/logout actions
+
+## Authentication Flow
+
+### Web Authentication Flow
+
+1. **Initial Request**:
+   - User navigates to application
+   - Auth0SessionModule checks for FormsAuthentication cookie
+   - If no cookie exists, redirects to /Account/Index (login page)
+
+2. **Login Process**:
+   - User clicks "Login" button on /Account/Index
+   - AccountController.Login redirects to Auth0 login page
+   - User enters credentials on Auth0 page
+   - Auth0 redirects back to /Account/UserInfo with tokens
+   - UserInfo method:
+     - Verifies Auth0 token
+     - Looks up user in database using email
+     - Checks for account status (locked, inactive, etc.)
+     - Creates FormsAuthentication ticket with user roles and profile
+     - Redirects to appropriate homepage
+
+3. **Subsequent Requests**:
+   - Auth0SessionModule validates FormsAuth cookie
+   - Checks for session timestamp cookie to detect inconsistencies
+   - BMSSessionModule sets up proper user identity
+   - Updates user activity timestamp
+
+4. **Timeout Handling**:
+   - When FormsAuth cookie expires (30 min default)
+   - Auth0SessionModule detects expiration
+   - Redirects to /Account/Index
+   - Avoids direct Auth0 redirects for consistent experience
+
+5. **Tab Synchronization**:
+   - UserSwitchDetectionModule tracks last known user
+   - When user changes (login in another tab), forces page refresh
+   - Ensures consistent user experience across browser tabs
+
+### Mobile Authentication Flow
+
+1. **Initial Login**:
+   - Mobile app redirects to Auth0 login
+   - After successful login, Auth0 redirects to mobile callback URL
+   - Mobile app calls /Account/UserInfo with Bearer token in Authorization header
+
+2. **API Authentication**:
+   - Mobile requests include Bearer token in Authorization header
+   - Auth0SessionModule and BMSSessionModule detect token
+   - Validate token and retrieve user information
+   - Set up user context without requiring FormsAuth cookie
+   - Enhanced token handling ensures consistent authentication
+
+3. **Response Handling**:
+   - UserInfo returns JSON with user details for mobile
+   - Subsequent API calls maintain Bearer token authentication
+
+## Logout Process
+
+1. **Web Logout**:
+   - User clicks Logout
+   - AccountController.Logout clears all cookies and session
+   - Signs out of both FormsAuth and Auth0
+   - Redirects to login page
+
+2. **Plan Admin Logout (VB Project)**:
+   - Called from VB component
+   - LogoutCookieModule intercepts any logout URL (/Account/LogOff or /Account/Logout)
+   - Ensures consistent cookie and session clearing
+   - Handles Auth0 logout even from legacy code
+
+## Key Authentication Mechanisms
+
+### Session Timestamp Cookie
+
+Added to detect authentication changes across tabs. When the timestamp cookie exists but auth cookie doesn't, we know authentication state has changed.
+
+```
+SessionTimestamp = DateTime.UtcNow.Ticks.ToString()
+```
+
+### FormsAuthentication Ticket
+
+Contains all user information needed for the application:
+- User ID
+- Roles
+- Session GUID
+- Client IP
+- User Agent
+
+Format:
+```
+userRoles + "|" + userProfile + "|" + TrueClientIP
+```
+
+## Edge Cases Handling
+
+1. **Multiple Tabs, Different Users**:
+   - UserSwitchDetectionModule compares cookie user with session user
+   - Forces page refresh when they don't match
+   - Ensures consistent experience
+
+2. **Timeout Redirection**:
+   - All modules redirect to /Account/Index not directly to Auth0
+   - Provides consistent timeout experience
+
+3. **Authentication State Mismatch**:
+   - If SessionTimestamp exists but auth cookie doesn't, cleans up state
+   - Prevents stale authentication headers
+
+4. **Redirect Loop Prevention**:
+   - Tracks redirect count to detect infinite loops
+   - Forces state cleanup if too many redirects occur
+
+5. **Cookie Tampering**:
+   - Validates integrity of FormsAuth ticket
+   - Redirects to login if validation fails
+
+6. **Mobile Token Handling**:
+   - Consistent token validation across all modules
+   - Proper user identity setup without FormsAuth cookie
+
+## Sequence Diagram (High-Level)
+
+```
+Browser/Mobile -> Application: Request
+Application -> Auth0SessionModule: Validate Auth
+Auth0SessionModule -> Auth0: Redirect if unauthenticated
+Auth0 -> Application: Callback with tokens
+Application -> AccountController: Process authentication
+AccountController -> FormsAuthentication: Create auth ticket
+Application -> BMSSessionModule: Setup user identity
+Application -> User: Authenticated response
+```
+
+## HTTP Module Execution Order
+
+1. Auth0SessionModule
+2. LogoutCookieModule
+3. UserSwitchDetectionModule
+4. BMSSessionModule
+
+This order ensures proper authentication validation, logout handling, user change detection, and session management.
+
+=======================
+# Code Explanation for Auth0 Integration Components
+
+## 1. FormsAuthentication Class Modifications
+
+```csharp
+public class FormsAuthentication : IFormsAuthentication
+{
+    // Constructor and dependencies remain the same
+    
+    public void SignIn(string userId, bool createPersistentCookie)
+    {
+        // 1. Get user information and roles from database
+        var userProfileRoles = _bmsDbUow.Users.GetProfileRoles(userId);
+        var userRoles = string.Join(";", userProfileRoles.WebRoles);
+        
+        // 2. Format user profile data for the ticket
+        var userProfile = string.Format(";{0};{1};{2};;{3};{4};{5}",
+            userProfileRoles.SessionGuid,
+            userProfileRoles.UserId,
+            userProfileRoles.LastWebCallDateTime.HasValue ? userProfileRoles.LastWebCallDateTime.Value.ToString("yyyyMMddHHmmss") : string.Empty,
+            userProfileRoles.ContactName,
+            request.UserHostAddress,
+            userAgentBase64);
+            
+        // 3. Create FormsAuthentication ticket with all user data
+        var ticket = new FormsAuthenticationTicket(
+            1, // Version
+            userProfileRoles.UserId, // Username
+            DateTime.Now, // Date ticket was issued
+            DateTime.Now.AddMinutes(_settings.AuthCookieExpirationInMinutes),  
+            createPersistentCookie,
+            userData);
+            
+        // 4. Add the encrypted ticket as a cookie
+        var authCookie = new HttpCookie(FormsAuth.FormsCookieName, ticketHash);
+        response.Cookies.Add(authCookie);
+        
+        // 5. Add session timestamp cookie to track authentication state
+        var sessionTimestampCookie = new HttpCookie("SessionTimestamp", DateTime.UtcNow.Ticks.ToString());
+        response.Cookies.Add(sessionTimestampCookie);
+        
+        // 6. Set up claims identity for OWIN compatibility
+        var claimsIdentity = new ClaimsIdentity("Auth0");
+        claimsIdentity.AddClaim(new Claim(ClaimTypes.Name, userId));
+        claimsIdentity.AddClaim(new Claim("BMSUserName", userId));
+        
+        // 7. Set current user for this request
+        var principal = new GenericPrincipal(claimsIdentity, userProfileRoles.WebRoles);
+        System.Threading.Thread.CurrentPrincipal = principal;
+        HttpContext.Current.User = principal;
+    }
+    
+    public void SignOut()
+    {
+        // 1. Clear all authentication cookies
+        ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Auth);
+        ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.TimeoutIndicator);
+        ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Context);
+        ExpireCookie("SessionTimestamp");
+        FormsAuth.SignOut();
+        
+        // 2. Clear session data
+        if (HttpContext.Current.Session != null)
+        {
+            HttpContext.Current.Session.Clear();
+            HttpContext.Current.Session.Abandon();
+        }
+        
+        // 3. Sign out of Auth0 via OWIN
+        var owinContext = HttpContext.Current.GetOwinContext();
+        if (owinContext != null)
+        {
+            owinContext.Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+            owinContext.Authentication.SignOut("Auth0");
+        }
+    }
+}
+```
+
+**Key Changes:**
+- Added `SessionTimestamp` cookie to track authentication state across tabs
+- Ensured consistent cleanup of all cookies during sign out
+- Added OWIN sign out to ensure Auth0 session is properly cleared
+
+## 2. Auth0SessionModule Class
+
+```csharp
+public class Auth0SessionModule : IHttpModule
+{
+    public void Init(HttpApplication app)
+    {
+        // 1. Register for early auth check and post-session acquisition
+        app.AuthenticateRequest += OnAuthenticateRequest;
+        app.PostAcquireRequestState += OnPostAcquireRequestState;
+    }
+    
+    private void OnAuthenticateRequest(object sender, EventArgs e)
+    {
+        // 1. Early check - especially for login pages
+        // 2. Clear timestamp cookie if auth cookie is missing
+        // 3. Ensures login page shows unauthenticated state
+    }
+    
+    private void OnPostAcquireRequestState(object sender, EventArgs e)
+    {
+        // 1. Skip for specified routes
+        if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()))
+            return;
+            
+        // 2. Handle mobile token requests
+        if (!string.IsNullOrEmpty(request.Headers["Authorization"]))
+            return;
+            
+        // 3. Check for FormsAuth cookie
+        var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
+        var timestampCookie = request.Cookies["SessionTimestamp"];
+        
+        // 4. No auth cookie = redirect to login
+        if (authCookie == null)
+        {
+            if (!AuthenticationHelper.ShouldSkipPages(request.Path.ToLowerInvariant()) &&
+                !app.Context.Request.Path.ToLowerInvariant().Contains("/account/login"))
+            {
+                RedirectToAuth0(app.Context);
+                return;
+            }
+        }
+        
+        // 5. Detect inconsistent state (auth cookie but no timestamp)
+        if (authCookie != null && timestampCookie == null) {
+            ClearAuthenticationState(app.Context);
+            RedirectToAuth0(app.Context);
+            return;
+        }
+        
+        // 6. Check IP address changes
+        if (authCookieInfo.IsAuthenticated && TrueClientIP != authCookieInfo.TrueClientIP) {
+            // Clear cookies, session and return unauthorized
+            // ...
+            return;
+        }
+        
+        // 7. Check for expired FormsAuth ticket
+        if (!app.Context.Request.Path.ToLowerInvariant().Contains("/account/login")) {
+            var ticket = FormsAuthentication.Decrypt(authCookie.Value);
+            if (ticket.Expired) {
+                ClearAuthenticationState(app.Context);
+                RedirectToAuth0(app.Context);
+                return;
+            }
+        }
+    }
+    
+    private void RedirectToAuth0(HttpContext context)
+    {
+        // Redirects to /Account/Index instead of Auth0 directly
+        // Ensures consistent timeout behavior
+        context.Response.Redirect("/Account/Index", false);
+    }
+    
+    private void ClearAuthenticationState(HttpContext context)
+    {
+        // Thoroughly clears all auth cookies and session
+        // Signs out of Auth0 via OWIN
+    }
+}
+```
+
+**Key Features:**
+- Handles both web and mobile authentication flows
+- Checks for inconsistent auth state (missing cookies)
+- Handles IP address changes (security feature)
+- Consistent redirect to login page
+- Complete state cleanup on authentication failures
+
+## 3. BMSSessionModule Class
+
+```csharp
+public class BmsSessionModule : IHttpModule
+{
+    public void Init(HttpApplication context)
+    {
+        context.PostAuthorizeRequest += Application_PostAuthorizeRequest;
+    }
+    
+    private void Application_PostAuthorizeRequest(object source, EventArgs e)
+    {
+        // 1. Special handling for mobile token
+        if (!string.IsNullOrEmpty(app.Context.Request.Headers["Authorization"]))
+            return;
+        
+        // 2. Skip specific routes
+        if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path))
+            return;
+        
+        // 3. For authenticated users, verify session state
+        if (app.Context.User != null && app.Context.User.Identity.IsAuthenticated)
+        {
+            // 4. Check callback URL
+            if (app.Context.Request.Path.ToLowerInvariant().Contains("account/userinfo"))
+                return;
+            
+            // 5. Verify auth cookie exists
+            if (authCookie == null)
+            {
+                TriggerReauthentication(app.Context);
+                return;
+            }
+            
+            // 6. Verify session timestamp cookie exists
+            if (timestampCookie == null) {
+                TriggerReauthentication(app.Context);
+                return;
+            }
+            
+            // 7. Validate ticket and update last activity
+            try {
+                var authCookieInfo = new AuthCookieInfo(authCookie);
+                var userId = GetEffectiveUserId(app.Context, authCookieInfo);
+                
+                // Validate expiration
+                var ticket = FormsAuthentication.Decrypt(authCookie.Value);
+                if (ticket.Expired) {
+                    TriggerReauthentication(app.Context);
+                    return;
+                }
+                
+                // Update last activity
+                bmsDbUow.Users.UpdateLastActivityDate(userId, authCookieInfo.SessionGuid);
+                
+                // Set up identity
+                SetupUserIdentity(app.Context, userId, authCookieInfo.Roles);
+            }
+            catch {
+                TriggerReauthentication(app.Context);
+            }
+        }
+    }
+    
+    private void SetupUserIdentity(HttpContext context, string userId, string[] roles)
+    {
+        // Creates user principal with proper identity and roles
+        var identity = new GenericIdentity(userId, CookieAuthenticationDefaults.AuthenticationType);
+        context.User = new GenericPrincipal(identity, roles);
+    }
+    
+    private string GetEffectiveUserId(HttpContext context, AuthCookieInfo cookieInfo)
+    {
+        // Gets user ID from claims or falls back to cookie
+        var claimsPrincipal = context.User as ClaimsPrincipal;
+        if (claimsPrincipal != null)
+        {
+            var userIdClaim = claimsPrincipal.FindFirst("BMSUserName");
+            if (userIdClaim != null)
+                return userIdClaim.Value;
+        }
+        return cookieInfo.UserName;
+    }
+    
+    private void TriggerReauthentication(HttpContext context)
+    {
+        // Redirects to login page
+        context.Response.Redirect("/Account/Index", false);
+    }
+}
+```
+
+**Key Features:**
+- Manages user identity after authentication
+- Updates last activity timestamp
+- Double-checks authentication validity 
+- Consistent re-authentication behavior
+
+## 4. LogoutCookieModule Class
+
+```csharp
+public class LogoutCookieModule : IHttpModule
+{
+    public void Init(HttpApplication context)
+    {
+        context.EndRequest += OnEndRequest;
+    }
+    
+    private void OnEndRequest(object sender, EventArgs e)
+    {
+        // 1. Check if any logout URL is being accessed
+        if (request.Path.ToLowerInvariant().Contains("/account/logoff") ||
+            request.Path.ToLowerInvariant().Contains("/account/logout"))
+        {
+            // 2. Clear all authentication cookies
+            ClearAllAuthCookies(context);
+            
+            // 3. Clear session
+            if (context.Session != null)
+            {
+                context.Session.Clear();
+                context.Session.Abandon();
+            }
+            
+            // 4. Sign out of Auth0
+            try
+            {
+                var owinContext = context.GetOwinContext();
+                if (owinContext != null)
+                {
+                    owinContext.Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+                    owinContext.Authentication.SignOut("Auth0");
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Error("Error signing out of Auth0", ex);
+            }
+        }
+    }
+    
+    private void ClearAllAuthCookies(HttpContext context)
+    {
+        // Clears all authentication-related cookies
+        // Includes FormsAuth, SessionTimestamp, and ASP.NET cookies
+    }
+}
+```
+
+**Key Features:**
+- Intercepts any logout URL (both /Logout and /LogOff)
+- Ensures consistent cookie and session cleanup
+- Handles Auth0 signout even from legacy VB code
+- Prevents partial logout issues
+
+## 5. UserSwitchDetectionModule Class
+
+```csharp
+public class UserSwitchDetectionModule : IHttpModule
+{
+    public void Init(HttpApplication context)
+    {
+        context.PreRequestHandlerExecute += OnPreRequestHandlerExecute;
+    }
+    
+    private void OnPreRequestHandlerExecute(object sender, EventArgs e)
+    {
+        // 1. Skip for API calls, static resources, etc.
+        if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path.ToLowerInvariant()))
+            return;
+            
+        // 2. Skip for unauthenticated requests
+        if (app.Context.User == null || !app.Context.User.Identity.IsAuthenticated)
+            return;
+            
+        // 3. Get current user ID from auth cookie
+        var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
+        if (authCookie == null) return;
+        
+        // 4. Compare current cookie user with session user
+        var authCookieInfo = new AuthCookieInfo(authCookie);
+        var currentCookieUser = authCookieInfo.UserName;
+        var lastKnownUser = app.Context.Session["LastKnownUserID"] as string;
+        
+        // 5. First request - store user ID
+        if (string.IsNullOrEmpty(lastKnownUser))
+        {
+            app.Context.Session["LastKnownUserID"] = currentCookieUser;
+            return;
+        }
+        
+        // 6. If user changed, force page refresh
+        if (lastKnownUser != currentCookieUser)
+        {
+            // Update session with new user
+            app.Context.Session["LastKnownUserID"] = currentCookieUser;
+            
+            // For HTML requests, redirect to force reload
+            if (!request.IsAjaxRequest())
+            {
+                string currentUrl = request.Url.PathAndQuery;
+                currentUrl += separator + "userChanged=" + DateTime.Now.Ticks;
+                response.Redirect(currentUrl, false);
+                app.CompleteRequest();
+            }
+            else
+            {
+                // For AJAX requests, add a header
+                response.Headers.Add("X-User-Changed", "true");
+            }
+        }
+    }
+}
+```
+
+**Key Features:**
+- Detects when user identity changes across tabs
+- Stores last known user in session state
+- Forces page reload when user changes
+- Handles both regular and AJAX requests differently
+- Prevents stale UI showing wrong user
+
+## 6. AccountController Updates
+
+```csharp
+public ActionResult Index(string returnUrl)
+{
+    // 1. Clear any stale authentication state
+    if (User.Identity.IsAuthenticated)
+    {
+        // 2. User is authenticated but still on login page - inconsistent state
+        _formsAuthentication.SignOut();
+        
+        // 3. Clear all authentication cookies
+        foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
+        {
+            if (cookieName.StartsWith(".AspNet") || 
+                cookieName == FormsAuthentication.FormsCookieName || 
+                cookieName == "SessionTimestamp")
+            {
+                var cookie = new HttpCookie(cookieName) { Expires = DateTime.Now.AddDays(-1) };
+                HttpContext.Response.Cookies.Add(cookie);
+            }
+        }
+        
+        // 4. Clear session and OWIN authentication
+        HttpContext.Session.Clear();
+        HttpContext.Session.Abandon();
+        HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+        HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
+    }
+    
+    // 5. Show login view
+    return View("~/Views/Account/Login.cshtml");
+}
+
+[AllowAnonymous]
+public ActionResult Login(string returnUrl)
+{
+    // 1. Clear any stale session timestamp cookie
+    var timestampCookie = Request.Cookies["SessionTimestamp"];
+    if (timestampCookie != null)
+    {
+        var expiredCookie = new HttpCookie("SessionTimestamp") { Expires = DateTime.Now.AddDays(-1) };
+        Response.Cookies.Add(expiredCookie);
+    }
+    
+    // 2. Challenge Auth0 authentication
+    HttpContext.GetOwinContext().Authentication.Challenge(new AuthenticationProperties
+    {
+        RedirectUri = returnUrl ?? Url.Action("UserInfo", "Account"),
+        Dictionary = { { "prompt", "login" } } // Force Re-authentication
+    },
+    "Auth0");
+
+    return new HttpUnauthorizedResult();
+}
+
+[Authorize]
+public void Logout()
+{
+    // 1. Sign out of FormsAuthentication
+    _formsAuthentication.SignOut();
+
+    // 2. Clear all cookies
+    foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
+    {
+        HttpCookie cookie = new HttpCookie(cookieName) { Expires = DateTime.Now.AddDays(-1) };
+        HttpContext.Response.Cookies.Add(cookie);
+    }
+    
+    // 3. Clear session
+    HttpContext.Session.Clear();
+    HttpContext.Session.Abandon();
+
+    // 4. Sign out of Auth0
+    HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+    HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
+    
+    // 5. Redirect to login page
+    Response.Redirect("/Account/Index", false);
+}
+```
+
+**Key Features:**
+- Ensures login page always shows unauthenticated state
+- Clears stale cookies before Auth0 redirect
+- Complete cookie and session cleanup on logout
+- Consistent redirection to login page
+
+## Code Interrelationships
+
+1. **Authentication Flow**:
+   - `AccountController` → Auth0 → `AccountController.UserInfo` → `FormsAuthentication.SignIn`
+   - Creates auth cookies and user identity
+
+2. **Request Validation**:
+   - `Auth0SessionModule` (first) - Basic cookie validation
+   - `BMSSessionModule` (later) - User identity setup
+   - `UserSwitchDetectionModule` (between them) - Detects user changes
+
+3. **Logout Flow**:
+   - Either `AccountController.Logout` or VB code LogOff 
+   - `LogoutCookieModule` intercepts both paths
+   - Ensures consistent cleanup regardless of entry point
+
+Each component focuses on a specific aspect of authentication while working together to create a seamless experience for both web and mobile users.
