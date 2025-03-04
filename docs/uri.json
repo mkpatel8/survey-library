@@ -40,795 +40,2065 @@
   }
 }
 
+===using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Configuration;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Net;
+using System.Security.Claims;
+using System.ServiceModel;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.UI;
+using Castle.Core.Internal;
+using EQ.ApplicationLogins;
+using EQ.EmailService;
+using EQ.EquitableHealth.ArgumentValidation;
+using EQ.EquitableHealth.Data.Bms.Data;
+using EQ.EquitableHealth.Data.Bms.DomainObjects;
+using EQ.EquitableHealth.Data.Web.Data;
+using EQ.EquitableHealth.Globalization;
+using EQ.EquitableHealth.Logging;
+using EQ.EquitableHealth.Templating;
+using EQ.EquitableHealth.Utilities.DateTime;
+using EQ.EquitableHealth.Utilities.String;
+using EQ.EquitableHealth.Utilities.SystemRoles;
+using EQ.EquitableHealth.Web;
+using EQ.Health.Web.FlexService;
+using EQ.Health.Web.PinService;
+using EQ.Health.Web.UserService;
+using Equitable.ApplicationOutages;
+using Equitable.AuditLogging;
+using Equitable.EquitableHealth.Data.Bms.Configuration;
+using Equitable.EquitableHealth.Web.Filters;
+using Equitable.EquitableHealth.Web.Models;
+using Equitable.EquitableHealth.Web.Security;
+using Microsoft.Owin.Security;
+using Microsoft.Owin.Security.Cookies;
+using Org.BouncyCastle.Asn1.Ocsp;
+using FormsAuthentication = System.Web.Security.FormsAuthentication;
 
-This is the classic tab synchronization issue with web applications. Let me explain what's happening:
-
-When Tab 1 loads initially as Plan Member, it has:
-1. The Plan Member's interface rendered in the HTML
-2. JavaScript that might reference the Plan Member role
-3. The page's state is built assuming Plan Member permissions
-
-Even though you logged out in Tab 2 and the authentication cookies now reflect Plan Admin, Tab 1 doesn't automatically know about this change until it makes a new server request.
-
-When you click within Tab 1, one of these behaviors might occur:
-1. Client-side navigation that doesn't hit the server (stays with Plan Member view)
-2. AJAX calls that include the new Plan Admin cookies but the UI remains Plan Member
-3. Some server calls that validate authentication but don't force a full page refresh
-
-To fix this specific case, we need to detect user changes across tabs. Here's a solution:
-
-```csharp
-public class UserSwitchDetectionModule : IHttpModule
+namespace Equitable.EquitableHealth.Web.Controllers
 {
-    public void Init(HttpApplication context)
+    [ApplicationOutageCheck]
+    [OutputCache(Location = OutputCacheLocation.None, NoStore = true)]
+    public class AccountController : ControllerBase
     {
-        context.PreRequestHandlerExecute += OnPreRequestHandlerExecute;
-    }
+        private readonly ITemplateEngine _templateEngine;
+        private readonly IFormsAuthentication _formsAuthentication;
+        private readonly IUserService _userService;
+        private readonly IEmailService _emailService;
+        private readonly IPinService _pinService;
+        private readonly IFlexService _flexService;
+        private readonly IBmsDbUow _bmsDbUow;
+        private readonly IEzClaimLookupDbUow _ezClaimLookupDbUow;
+        private readonly IOutageManager _outageManager;
+        private readonly IAuditLogger _audit;
+        private readonly ApplicationSettings _settings;
+        private readonly ILog<AccountController> _log;
+        private readonly IApplicationLoginLogger _loginLogger;
+        private readonly ActivationEmailHelper _activationEmailHelper;
 
-    private void OnPreRequestHandlerExecute(object sender, EventArgs e)
-    {
-        var app = sender as HttpApplication;
-        if (app == null) return;
+        private const string TrustedMachineCookieName = "EquitableHealth_TM";
+        private const string TrustedMachineTokenFormat = "{0}|{1}|EQUITABLE_HEALTH_TM_KEY";
 
-        // Skip for API calls, static resources, etc.
-        if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path.ToLowerInvariant()))
-            return;
-
-        // Skip for unauthenticated requests
-        if (app.Context.User == null || !app.Context.User.Identity.IsAuthenticated)
-            return;
-
-        var request = app.Context.Request;
-        var response = app.Context.Response;
-
-        // Get current user ID from authentication cookie
-        var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
-        if (authCookie == null) return;
-
-        try
+        public AccountController(
+            ITemplateEngine templateEngine,
+            IFormsAuthentication formsAuthentication,
+            IUserService userService,
+            IEmailService emailService,
+            IPinService pinService,
+            IFlexService flexService,
+            IBmsDbUow bmsDbUow,
+            IEzClaimLookupDbUow ezClaimLookupDbUow,
+            IOutageManager outageManager,
+            IAuditLogger audit,
+            ApplicationSettings settings,
+            ILog<AccountController> log,
+            IApplicationLoginLogger loginLogger,
+            ActivationEmailHelper activationEmailHelper)
         {
-            var authCookieInfo = new AuthCookieInfo(authCookie);
-            var currentCookieUser = authCookieInfo.UserName;
-            
-            // Get currently rendered user from session
-            var lastKnownUser = app.Context.Session["LastKnownUserID"] as string;
-            
-            // If this is the first request in this session, store the user
-            if (string.IsNullOrEmpty(lastKnownUser))
+            Check.Argument.IsNotNull(templateEngine, "templateEngine");
+            Check.Argument.IsNotNull(formsAuthentication, "formsAuthentication");
+            Check.Argument.IsNotNull(userService, "userService");
+            Check.Argument.IsNotNull(emailService, "emailService");
+            Check.Argument.IsNotNull(pinService, "pinService");
+            Check.Argument.IsNotNull(flexService, "flexService");
+            Check.Argument.IsNotNull(bmsDbUow, "bmsDbUow");
+            Check.Argument.IsNotNull(ezClaimLookupDbUow, "ezClaimLookupDbUow");
+            Check.Argument.IsNotNull(outageManager, "outageManager");
+            Check.Argument.IsNotNull(audit, "audit");
+            Check.Argument.IsNotNull(settings, "settings");
+            Check.Argument.IsNotNull(log, "log");
+            Check.Argument.IsNotNull(loginLogger, "loginLogger");
+            Check.Argument.IsNotNull(activationEmailHelper, "activationEmailHelper");
+
+            _templateEngine = templateEngine;
+            _formsAuthentication = formsAuthentication;
+            _userService = userService;
+            _emailService = emailService;
+            _pinService = pinService;
+            _flexService = flexService;
+            _bmsDbUow = bmsDbUow;
+            _ezClaimLookupDbUow = ezClaimLookupDbUow;
+            _outageManager = outageManager;
+            _audit = audit;
+            _settings = settings;
+            _log = log;
+            _loginLogger = loginLogger;
+            _activationEmailHelper = activationEmailHelper;
+        }
+
+        public ActionResult Index(string returnUrl, string reset = null)
+        {
+            // Handle reset parameter - clear all cookies and state
+            if (!string.IsNullOrEmpty(reset))
             {
-                app.Context.Session["LastKnownUserID"] = currentCookieUser;
-                return;
-            }
-            
-            // If user has changed, force a full page refresh to the same URL
-            if (lastKnownUser != currentCookieUser)
-            {
-                // Update session with new user
-                app.Context.Session["LastKnownUserID"] = currentCookieUser;
-                
-                // Only force reload for HTML requests (not AJAX or API)
-                if (!request.IsAjaxRequest() && 
-                    !request.Path.ToLowerInvariant().Contains("/api/"))
+                foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
                 {
-                    // Redirect to same URL to force a complete page reload
-                    string currentUrl = request.Url.PathAndQuery;
-                    
-                    // Add or update a parameter to prevent browser caching
-                    string separator = currentUrl.Contains("?") ? "&" : "?";
-                    currentUrl += separator + "userChanged=" + DateTime.Now.Ticks;
-                    
-                    response.Redirect(currentUrl, false);
-                    app.CompleteRequest();
+                    var cookie = new HttpCookie(cookieName)
+                    {
+                        Expires = DateTime.Now.AddDays(-1),
+                        Domain = FormsAuthentication.CookieDomain
+                    };
+                    HttpContext.Response.Cookies.Add(cookie);
+                }
+
+                HttpContext.Session.Clear();
+                HttpContext.Session.Abandon();
+
+                HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+                HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
+            }
+
+
+            // Clear any stale authentication state when viewing login page
+            if (User.Identity.IsAuthenticated)
+            {
+                // User is authenticated but still reached login page
+                // This is an inconsistent state - force re-authentication
+                _formsAuthentication.SignOut();
+
+                // Clear all cookies that might indicate authentication
+                foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
+                {
+                    if (cookieName.StartsWith(".AspNet") ||
+                        cookieName == FormsAuthentication.FormsCookieName ||
+                        cookieName == "SessionTimestamp")
+                    {
+                        var cookie = new HttpCookie(cookieName)
+                        {
+                            Expires = DateTime.Now.AddDays(-1),
+                            Domain = FormsAuthentication.CookieDomain
+                        };
+                        HttpContext.Response.Cookies.Add(cookie);
+                    }
+                }
+
+                HttpContext.Session.Clear();
+                HttpContext.Session.Abandon();
+
+                HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+                HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
+            }
+
+            if (!string.IsNullOrEmpty(returnUrl))
+            {
+                return View(returnUrl);
+            }
+            return View("~/Views/Account/Login.cshtml");
+        }
+
+        [AllowAnonymous]
+        public ActionResult Login(string returnUrl)
+        {
+            // Ensure no stale cookies before redirecting to Auth0
+            var timestampCookie = Request.Cookies["SessionTimestamp"];
+            if (timestampCookie != null)
+            {
+                var expiredCookie = new HttpCookie("SessionTimestamp")
+                {
+                    Expires = DateTime.Now.AddDays(-1),
+                    Domain = FormsAuthentication.CookieDomain
+                };
+                Response.Cookies.Add(expiredCookie);
+            }
+
+            HttpContext.GetOwinContext().Authentication.Challenge(new AuthenticationProperties
+            {
+                RedirectUri = returnUrl ?? Url.Action("UserInfo", "Account"),
+                Dictionary = { { "prompt", "login" } } // Force Re-authentication
+            },
+            "Auth0");
+
+            return new HttpUnauthorizedResult();
+        }
+
+        [AppAuthorize]
+        public ActionResult UserInfo()
+        {
+            if ((HttpContext.User.Identity != null
+                && HttpContext.User.Identity.IsAuthenticated) || IsValidMobileToken())
+            {
+                string emailAddress = GetUserEmail();
+                string userName = _bmsDbUow.Users.GetUserIdFromEmailAddress(emailAddress);
+
+                if (string.IsNullOrEmpty(userName))
+                {
+                    return null;
+                }
+
+                var credentials = _bmsDbUow.Users.GetCredentials(userName);
+
+                if (credentials.IsLockedOut)
+                {
+                    throw new AccountLockedException();
+                }
+                if (credentials.Status != UserStatus.Active)
+                {
+                    if (credentials.Status == UserStatus.NewStatus)
+                    {
+                        throw new AccountNotActivatedException();
+                    }
+
+                    throw new AccountNotAvailableException();
+                }
+
+                _bmsDbUow.Users.UpdateCredentialsSuccessfulLogin(userName,
+                    Request.UserHostAddress, Request.Browser.Type, Request.Browser.Version,
+                    Request.UserHostName, Request.Browser.Cookies, Request.Browser.Platform);
+
+                // Make the PM select their cert again if they have multiple
+                var pmCertIdCookie = Request.Cookies[EQ.EquitableHealth.Web.Constants.CookieNames.PmCertId];
+                if (pmCertIdCookie != null)
+                {
+                    pmCertIdCookie = new HttpCookie(EQ.EquitableHealth.Web.Constants.CookieNames.PmCertId, null);
+                    pmCertIdCookie.Expire();
+                    Response.Cookies.Add(pmCertIdCookie);
+                }
+
+                _formsAuthentication.SignIn(userName, false);
+
+                _audit.Log(Constants.AuditCategory.Account, userName, "User Logged In", credentials.UserId, "User has logged in", credentials.UserId, null);
+                _loginLogger.Log(_settings.ApplicationName, credentials.UserId, DateTime.UtcNow, Request.UserHostAddress, Request.UserAgent);
+
+                if (User.IsPm())
+                {
+                    _bmsDbUow.Policies.GetPolicyList(credentials.UserId, WebRole.PlanMember, true);
+                }
+
+                if (IsValidMobileToken())
+                {
+                    var userProfile = _bmsDbUow.Users.GetUserProfile(credentials.UserId);
+                    return this.JsonNet(new LoginJsonModel
+                    {
+                        UserId = credentials.UserId,
+                        UserRoles = User.GetWebRoles().Select(r => r.ToString()).ToArray(),
+                        ContactName = userProfile.ContactName,
+                        Message = null
+                    });
+                }
+                if (User.IsPm() && credentials.IsFlexUser)
+                {
+                    var windowResponse = _flexService.GetEnrolmentWindows(new GetEnrolmentWindowsRequest
+                    {
+                        UserId = User.Identity.Name,
+                        Language = Culture.Current.TwoLetterISOLanguageName,
+                    });
+
+                    if (windowResponse.EnrolmentWindows.Any())
+                    {
+                        return Redirect(Url.PmFlexEnrolments(Url.Home()));
+                    }
+                }
+            }
+            return Redirect(Url.Home());
+        }
+
+        private bool IsValidMobileToken()
+        {
+            var authHeader = Request.Headers["Authorization"];
+            if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer"))
+            {
+                try
+                {
+                    var token = authHeader.Substring("Bearer".Length);
+                    var handler = new JwtSecurityTokenHandler();
+                    var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+                    _log.Error("AccountController + jsonToken:" + jsonToken);
+                    if (jsonToken != null)
+                    {
+                        // Validate token expiration
+                        if (jsonToken.ValidTo < DateTime.UtcNow)
+                        {
+                            return false;
+                        }
+
+                        // Validate issuer
+                        if (jsonToken.Issuer != $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/")
+                        {
+                            return false;
+                        }
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        private string GetUserEmail()
+        {
+            // For web authentication
+            if (User.Identity.IsAuthenticated)
+            {
+                var claimsIdentity = User.Identity as ClaimsIdentity;
+                return claimsIdentity?.FindFirst(ClaimTypes.Email)?.Value;
+            }
+
+            // For mobile authentication
+            var authHeader = Request.Headers["Authorization"];
+            if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer"))
+            {
+                var token = authHeader.Substring("Bearer".Length);
+                var handler = new JwtSecurityTokenHandler();
+                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+
+                return jsonToken?.Claims.FirstOrDefault(c => c.Type == "name")?.Value;
+            }
+            return null;
+        }
+
+        [Authorize]
+        public void Logout()
+        {
+            _formsAuthentication.SignOut();
+
+            // Thoroughly clean up cookies
+            foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
+            {
+                HttpCookie cookie = new HttpCookie(cookieName)
+                {
+                    Expires = DateTime.Now.AddDays(-1)
+                };
+
+                if (cookieName == FormsAuthentication.FormsCookieName ||
+                    cookieName.StartsWith(".AspNet") ||
+                    cookieName == "SessionTimestamp")
+                {
+                    cookie.Domain = FormsAuthentication.CookieDomain;
+                }
+
+                HttpContext.Response.Cookies.Add(cookie);
+            }
+
+            // Clear session
+            HttpContext.Session.Clear();
+            HttpContext.Session.Abandon();
+
+            // Clear Auth0 session
+            HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+            HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
+
+            // Redirect to login page instead of Auth0 logout page to prevent automatic relogin
+            Response.Redirect("/Account/Index", false);
+            HttpContext.ApplicationInstance.CompleteRequest();
+        }
+
+        //
+        // GET: /Account/ForgotPassword
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult ForgotPassword()
+        {
+            return View();
+        }
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ValidateAntiForgeryToken]
+        public ActionResult ForgotPassword(ForgotPasswordModel model)
+        {
+            if (ModelState.IsValid)
+            {
+                var userProfile = _bmsDbUow.Users.GetUserProfile(model.UserId);
+                var credentials = _bmsDbUow.Users.GetCredentials(model.UserId);
+
+                if (userProfile == null || credentials == null)
+                {
+                    // Deloitte audit - Attacker could enumerate usernames and find valid users
+                    // Redirect users to Forgot Password
+                    return Redirect(Url.ForgotPasswordMailSent());
+                }
+
+                if (credentials.IsLockedOut)
+                {
+                    ModelState.AddModelError("", this.GetString("login", "lblErrorAccountLocked").FormatWith(_settings.AccountLockoutTimeInMinutes));
+                    return View(model);
+                }
+
+                if (credentials.Status != EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.Active)
+                {
+                    if (credentials.Status == EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.NewStatus)
+                    {
+                        ModelState.AddModelError("", this.GetString("login", "lblErrorAccountNotActivated"));
+                        return View(model);
+                    }
+
+                    ModelState.AddModelError("", this.GetString("login", "lblErrorAccountNotAvailable"));
+                    return View(model);
+                }
+
+                if (string.IsNullOrEmpty(userProfile.Email))
+                {
+                    ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblNoEmailAddressForUser"));
+                    return View(model);
+                }
+
+                var pin = _pinService.GeneratePin(_settings.ApplicationName, "ResetPassword");
+
+                _bmsDbUow.Users.CreateForgotPasswordRequest(userProfile.UserId, pin.PinId);
+
+                var encryptedToken = EncryptPin(model.UserId, pin.Pin);
+                var resetPasswordUrl = Url.ToAbsolute(Url.InitiateResetPassword(encryptedToken));
+
+                var templateContext = new Dictionary<string, object>
+                                          {
+                                              {"userProfile", userProfile},
+                                              {"resetPasswordUrl", resetPasswordUrl},
+                                              {"logoUrl", Url.EqLogoUrl()},
+                                              {"prodSupportEmail", _settings.ProdSupportEmail},
+                                              {"equitablePhone", _settings.EquitablePhone},
+                                              {"equitablePhoneTollFree", _settings.EquitablePhoneTollFree}
+                                          };
+
+                var subject = _templateEngine.Run(string.Format(Constants.Templates.ForgotPasswordEmailSubject, Culture.Current.TwoLetterISOLanguageName), templateContext);
+                var body = _templateEngine.Run(string.Format(Constants.Templates.ForgotPasswordEmailBody, Culture.Current.TwoLetterISOLanguageName), templateContext);
+
+                var email = new SendRequest
+                {
+                    Subject = subject,
+                    Source = _settings.ApplicationName,
+                    From = _settings.NoReplyEmail,
+                    To = new[] { new Recipient { EmailAddress = userProfile.Email } },
+                    Body = body,
+                    IsBodyHtml = true,
+                    MailerApiKey = _settings.MandrillMailerApiKey,
+                    SendImmediately = true
+                };
+
+                _emailService.Send(email);
+
+                return Redirect(Url.ForgotPasswordMailSent());
+            }
+
+            return View(model);
+        }
+
+        //
+        // GET: /Account/ForgotUsername
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult ForgotUsername()
+        {
+            return View();
+        }
+
+        //
+        // POST: /Account/ForgotUsername
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ValidateAntiForgeryToken]
+        [ExportViewDataToTempData]
+        public ActionResult ForgotUsername(ForgotUsernameModel model)
+        {
+            if (ModelState.IsValid)
+            {
+                var userAccounts = _bmsDbUow.Users.GetUserAccounts(model.EmailAddress);
+
+                if (userAccounts == null)
+                {
+                    // Deloitte audit - Attacker could enumerate usernames and find valid users
+                    // Redirect users to Login Page with Recovery Success Message
+                    ViewData.Model = new LoginModel { UserName = "" };
+                    ViewBag.SuccessMessage = this.GetString("forgotUsername", "lblUsernameRecoverySuccess");
+                    return Redirect(Url.Login());
+                }
+
+                var accounts = new ArrayList();
+                foreach (var userAccount in userAccounts)
+                {
+                    for (var i = 0; i < userAccount.WebRoles.Length; i++)
+                    {
+                        userAccount.WebRoles[i] = this.GetString("forgotUsername", userAccount.WebRoles[i]);
+                    }
+
+                    accounts.Add(new
+                    {
+                        UserId = userAccount.UserId,
+                        WebRoles = string.Join(", ", userAccount.WebRoles)
+                    });
+                }
+
+                var templateContext = new Dictionary<string, object>
+                                          {
+                                              {"userAccounts", accounts.ToArray()},
+                                              {"logoUrl", Url.EqLogoUrl()},
+                                              {"prodSupportEmail", _settings.ProdSupportEmail},
+                                              {"equitablePhone", _settings.EquitablePhone},
+                                              {"equitablePhoneTollFree", _settings.EquitablePhoneTollFree},
+                                              {"loginUrl", Url.ToAbsolute(Url.Login())}
+                                          };
+
+                var subject = _templateEngine.Run(string.Format(Constants.Templates.ForgotUsernameEmailSubject, Culture.Current.TwoLetterISOLanguageName), templateContext);
+                var body = _templateEngine.Run(string.Format(Constants.Templates.ForgotUsernameEmailBody, Culture.Current.TwoLetterISOLanguageName), templateContext);
+
+                var email = new SendRequest
+                {
+                    Subject = subject,
+                    Source = _settings.ApplicationName,
+                    From = _settings.NoReplyEmail,
+                    To = new[] { new Recipient { EmailAddress = model.EmailAddress } },
+                    Body = body,
+                    IsBodyHtml = true,
+                    MailerApiKey = _settings.MandrillMailerApiKey,
+                    SendImmediately = true
+                };
+
+                _emailService.Send(email);
+                _audit.Log(Constants.AuditCategory.Account, model.EmailAddress, "Username retrieval", model.EmailAddress, "User has requested associated usernames", model.EmailAddress, null);
+
+                ViewData.Model = new LoginModel();
+
+                ViewBag.SuccessMessage = this.GetString("forgotUsername", "lblUsernameRecoverySuccess");
+
+                return Redirect(Url.Login());
+            }
+
+            return View(model);
+        }
+
+        //
+        // POST: /Account/CheckUserNameExists
+
+        [HttpPost]
+        [AllowAnonymous]
+        public JsonResult CheckUserNameExists(string userId)
+        {
+            var userProfile = _bmsDbUow.Users.GetUserProfile(userId);
+
+            return Json(userProfile != null);
+        }
+
+        //
+        // GET: /Account/ForgotPasswordMailSent
+
+        [HttpGet]
+        [AllowAnonymous]
+        public ActionResult ForgotPasswordMailSent()
+        {
+            return View();
+        }
+
+        //
+        // GET: /Account/ResetPassword
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ExportViewDataToTempData]
+        public ActionResult InitiateResetPassword(string token)
+        {
+            string decryptedToken;
+            try
+            {
+                decryptedToken = EQ.EquitableHealth.Cryptography.Encryption.DecryptAESFromBase64(token, Constants.PinEncryptionKey);
+            }
+            catch
+            {
+                // token is not valid
+                ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblResetPasswordInvalidToken"));
+                return Redirect(Url.ForgotPassword());
+            }
+
+            var tokens = decryptedToken.Split('|');
+            var userId = tokens[0];
+            var pin = tokens[1];
+
+            var latestRequest = _bmsDbUow.Users.GetLatestForgotPasswordRequest(userId);
+
+            if (latestRequest == null)
+            {
+                // This user has never requested a password reset
+                ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblResetPasswordInvalidToken"));
+                return Redirect(Url.ForgotPassword());
+            }
+
+            bool isPinValid;
+            bool isPinAlreadyUsed = false;
+
+            try
+            {
+                isPinValid = _pinService.VerifyPin(latestRequest.PinId, pin);
+            }
+            catch (FaultException<InvalidPinFault>)
+            {
+                isPinValid = false;
+            }
+            catch (FaultException<ExpiredPinFault>)
+            {
+                isPinValid = false;
+            }
+            catch (FaultException<UsedPinFault>)
+            {
+                isPinValid = false;
+                isPinAlreadyUsed = true;
+            }
+
+            if (!isPinValid)
+            {
+                if (isPinAlreadyUsed)
+                {
+                    ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblResetPasswordTokenAlreadyUsed"));
                 }
                 else
                 {
-                    // For AJAX requests, add a header that client code could detect
-                    response.Headers.Add("X-User-Changed", "true");
+                    ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblResetPasswordInvalidToken"));
+                }
+
+                return Redirect(Url.ForgotPassword());
+            }
+
+            Session[Constants.SessionKeys.ResetPasswordUserId] = userId;
+
+            return Redirect(Url.ResetPassword());
+        }
+
+        //
+        // GET: /Account/ResetPassword
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult ResetPassword()
+        {
+            var userId = Session[Constants.SessionKeys.ResetPasswordUserId] as string;
+
+            if (string.IsNullOrEmpty(userId))
+                return Redirect(Url.Login());
+
+            return View();
+        }
+
+        //
+        // POST: /Account/ResetPassword
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ValidateAntiForgeryToken]
+        [ExportViewDataToTempData]
+        public ActionResult ResetPassword(ResetPasswordModel model)
+        {
+            if (ModelState.IsValid)
+            {
+                var userId = Session[Constants.SessionKeys.ResetPasswordUserId] as string;
+
+                if (!string.IsNullOrEmpty(userId))
+                {
+                    var request = new ResetPasswordRequest
+                    {
+                        UserId = userId,
+                        Language = Culture.Current.TwoLetterISOLanguageName,
+                        NewPassword = model.NewPassword
+                    };
+
+                    try
+                    {
+                        _userService.ResetPassword(request);
+                        Session[Constants.SessionKeys.ResetPasswordUserId] = null;
+
+                        // Attempt auto-login using new credentials
+                        if (System.Web.Security.Membership.Provider.ValidateUser(userId, model.NewPassword))
+                        {
+                            return SignInAndRedirect(userId);
+                        }
+
+                        _audit.Log(Constants.AuditCategory.Account, userId, "User Reset Password", userId, "User has reset their password", userId, null);
+
+                        return Redirect(Url.Login());
+                    }
+                    catch (FaultException<LockFault> exc)
+                    {
+                        // unable to obtain lock on user profile record
+                        _log.Info("CoreWS returned lock fault when resetting password", exc);
+                        ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblResetPasswordLockFailed"));
+                    }
+                    catch (FaultException<InvalidPasswordFault> exc)
+                    {
+                        // password entered is the users current password
+                        _log.Info("CoreWS returned invalid password fault when resetting password", exc);
+                        ViewData.ModelState.AddModelError(string.Empty, this.GetString("forgotPassword", "lblInvalidPassword"));
+                    }
+                }
+            }
+
+            return Redirect(Url.ResetPassword());
+        }
+
+        //
+        // POST: /Account/ChangePassword
+
+        [HttpPost]
+        [ImportViewDataFromTempData]
+        public ActionResult ChangePassword(ChangePasswordModel model)
+        {
+            var result = new GenericJsonModel();
+
+            if (ModelState.IsValid)
+            {
+                var userId = User.Identity.Name;
+
+                try
+                {
+                    if (System.Web.Security.Membership.Provider.ChangePassword(userId, model.CurrentPassword, model.NewPassword))
+                    {
+                        _log.Info("User {0} changed their password".FormatWith(userId));
+                        _audit.Log(Constants.AuditCategory.Account, userId, "User Changed Password", userId, "User has changed their password", userId, null);
+                    }
+                    else
+                    {
+                        _log.Info("User {0} did not provide correct current password when attempting to reset password".FormatWith(userId));
+                        ModelState.AddModelError(string.Empty, this.GetString("changePassword", "lblInvalidCredentials"));
+                    }
+                }
+                catch (FaultException<LockFault> exc)
+                {
+                    // unable to obtain lock on user profile record
+                    _log.Info("CoreWS returned lock fault when resetting password for user {0}".FormatWith(userId), exc);
+                    ViewData.ModelState.AddModelError(string.Empty, this.GetString("changePassword", "lblChangePasswordLockFailed"));
+                }
+                catch (FaultException<InvalidPasswordFault> exc)
+                {
+                    // password entered is the users current password
+                    _log.Info("CoreWS returned invalid password fault when resetting password for user {0}".FormatWith(userId), exc);
+                    ViewData.ModelState.AddModelError(string.Empty, this.GetString("changePassword", "lblInvalidPassword"));
+                }
+                catch (Exception exc)
+                {
+                    // Lock fault is never returned - should have a try/catch around the object lock. Instead, a general exception is thrown
+                    _log.Info("CoreWS threw exception when resetting password for user {0}".FormatWith(userId), exc);
+                    ViewData.ModelState.AddModelError(string.Empty,
+                        this.GetString("changePassword", "lblUpdateException"));
+                }
+            }
+
+            result.Errors = ModelState.GetErrorMessages().ToList();
+
+            return this.JsonNet(result);
+        }
+
+        //
+        // GET: /Account/ForgotPassword
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult Activate()
+        {
+            return View();
+        }
+
+        //
+        // GET: /Account/ActivatePlanMember
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult ActivatePlanMember()
+        {
+            _log.InfoFormat("Entered ActivatePlanMember line 1");
+
+            var model = ViewData.Model as ActivatePlanMemberModel ?? new ActivatePlanMemberModel();
+
+            return View(model);
+        }
+
+        //
+        // POST: /Account/ActivatePlanMember
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ExportViewDataToTempData]
+        public ActionResult ActivatePlanMember(ActivatePlanMemberModel model)
+        {
+            var pmEmailAddress = "";
+            var pmUserId = "";
+            string passwordChangeURL = string.Empty;
+            var sendEmail = true;
+
+            if (ModelState.IsValid)
+            {
+                _log.InfoFormat("Plan member is trying to activate account. FirstName: {0}, LastName: {1}, BirthDate: {2}, PolicyNumber: {3}, CertificateNumber: {4}",
+                    model.FirstName, model.LastName, model.BirthDate, model.PolicyNumber, model.CertificateNumber);
+
+                // PM activation scenarios:
+                // 1) Account is already active
+                // 2) Account is active but there is also a second "New" account
+                // 3) All accounts are in some other state other than New/Active
+                // 4) No account found at all
+                // 5) Multiple "New" accounts
+
+                // Validate user input
+                var userIdentities = _bmsDbUow.Users.GetUserIdentities(model.FirstName,
+                                                                       model.LastName,
+                                                                       model.BirthDate.Value,
+                                                                       model.PolicyNumber.PadLeft(6, '0'),
+                                                                       model.CertificateNumber.PadLeft(10, '0')).ToList();
+
+                // Determine if there are any active identities and if there are do not continue
+                if (userIdentities.Any(id => id.Status == EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.Active))
+                {
+                    _log.Warn("One or more accounts are already active - user should use the active account");
+
+                    if (userIdentities.Any(id => id.Status == EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.NewStatus))
+                    {
+                        _log.Warn("User also has an account in new status - multiple accounts are not allowed");
+                        ModelState.AddModelError("", this.GetString("activation", "lblMultipleAccountsError"));
+                        return Redirect(Url.ActivatePlanMember());
+                    }
+
+                    _log.Warn("Plan member account could not be activated because it is already active.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountAlreadyActiveError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+
+                if (userIdentities.Any() && userIdentities.All(id => id.Status != EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.NewStatus))
+                {
+                    _log.Warn("Plan member account could not be activated because it does not have an identity that is in new status.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountNotNewError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+
+                // Filter identities to only new
+                userIdentities = userIdentities.Where(id => id.Status == EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.NewStatus).ToList();
+
+                if (!userIdentities.Any())
+                {
+                    _log.Warn("Plan member account could not be activated because it did not match up with an identity.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountNotFoundError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+
+                if (userIdentities.Count() > 1)
+                {
+                    _log.Warn("Plan member account could not be activated because it matched multiple new identities.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblMultipleAccountsError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+
+                // Only one new identity so we can continue
+                var userIdentity = userIdentities.Single();
+
+                var emailAddress = GetUserEmail(userIdentity.UserId);
+
+                //set userId
+                pmUserId = userIdentity.UserId;
+
+                if (string.IsNullOrEmpty(emailAddress) && string.IsNullOrEmpty(model.Email))
+                {
+                    _log.InfoFormat("No email on file - prompting user to enter one.");
+                    TempData["Flag"] = true;
+                    return Redirect(Url.ActivatePlanMember());
+                }
+
+                // If there is an email in the activation form, set it to email address variable to use later
+                if (!string.IsNullOrEmpty(model.Email))
+                {
+                    pmEmailAddress = model.Email;
+                }
+                // If there is an email in the on the BMS profile, set it to email address variable to use later
+                if (!string.IsNullOrEmpty(emailAddress))
+                {
+                    pmEmailAddress = emailAddress;
+                }
+                _log.InfoFormat("Plan Member Email: {0}", pmEmailAddress);
+
+                var certId = _bmsDbUow.Users.GetCertId(model.PolicyNumber, model.CertificateNumber);
+                _log.InfoFormat("CertId: {0}", certId);
+
+                try
+                {
+                    // Call service to activate account
+                    _userService.ActivateAccount(new ActivateAccountRequest
+                    {
+                        UserId = userIdentity.UserId,
+                        Language = Culture.Current.TwoLetterISOLanguageName,
+                        Email = pmEmailAddress,
+                        ChallengeQuestion = "",
+                        ChallengeResponse = ""
+                    });
+                }
+                catch (FaultException<InvalidUserFault> exc)
+                {
+                    _log.Warn("CoreWS returned invalid user fault when activating PM account", exc);
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountNotFoundError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+                catch (FaultException<InvalidUserStatusFault> exc)
+                {
+                    _log.Warn("CoreWS returned invalid user status fault when activating PM account", exc);
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountNotNewError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+                catch (FaultException<LockFault> exc)
+                {
+                    _log.Warn("CoreWS returned lock fault when activating PM account", exc);
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountLockError"));
+                    return Redirect(Url.ActivatePlanMember());
+                }
+                catch (Exception ex)
+                {
+                    //Check for OKTA Duplicate Email Errors (OKTA1, OKTA2 or OKTA9) and return the OKTA error back
+                    var OKTAErrCode = ex.Message;
+                    if (OKTAErrCode.IndexOf("OKTA") != -1)
+                    {
+                        OKTAErrCode = OKTAErrCode.Substring(OKTAErrCode.IndexOf("OKTA"), 5);
+                        if (OKTAErrCode == "OKTA1")
+                        {
+                            ModelState.AddModelError("", this.GetString("activation", "lblOktaFault1"));
+                        }
+                        else if (OKTAErrCode == "OKTA2")
+                        {
+                            ModelState.AddModelError("", this.GetString("activation", "lblOktaFault2"));
+                        }
+                        else
+                        {
+                            ModelState.AddModelError("", this.GetString("activation", "lblOktaFault9"));
+                        }
+                        _log.InfoFormat("OKTA Error - prompting user to enter new email.");
+                        TempData["Flag"] = true;
+                        return Redirect(Url.ActivatePlanMember());
+                    }
+                    else
+                    {
+                        // Log the exception details
+                        _log.Warn("caught in my custom catch: ", ex);
+                        throw new FaultException("An error occurred while processing your request.");
+                    }
+                }
+                _log.Info("Plan member account has been activated successfully, sending activation email.");
+
+                var extraBenefitsEligibilityData = _bmsDbUow.Users.GetExtraBenefitsEligibility(Constants.DbUserName.Incubed, pmEmailAddress);
+                var oktaUserId = string.Empty;
+
+                // Search for PMs Okta account
+                var actionResult = OktaApiService.SearchOktaUserByEmail(pmEmailAddress);
+                var contentResult = actionResult as ContentResult;
+                oktaUserId = contentResult?.Content;
+                var policyNumber = int.Parse(model.PolicyNumber);
+
+                // Get User Permisssions to check for multiple roles
+                UserAccountBrief permission = _bmsDbUow.Users.GetUserPermission(pmEmailAddress);
+
+                // If PM has an Okta account, update the meta data
+                if (!string.IsNullOrEmpty(oktaUserId))
+                {
+                    try
+                    {
+                        _log.InfoFormat("Okta account was found! {0}", oktaUserId);
+                        UpdateOkta(ref sendEmail, permission, oktaUserId, policyNumber);
+                        _log.InfoFormat("Okta account created");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error("Error updating user in Okta for: '{0}'".FormatWith(pmEmailAddress), ex);
+                        //Rollback user activation
+                        _bmsDbUow.Users.RollBackUserActivation(pmUserId);
+                        ModelState.AddModelError("", this.GetString("activation", "lblOktaFault9"));
+                        return Redirect(Url.ActivatePlanMember());
+                    }
+                }
+                else
+                {
+                    _log.InfoFormat("No Okta account was found");
+                    var fullName = model.FirstName + " " + model.LastName;
+                    var userId = "";
+
+                    try
+                    {
+                        var response = OktaApiService.CreateNewOktaUser(permission, pmEmailAddress, model.FirstName, model.LastName, fullName, policyNumber);
+                        userId = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        _log.InfoFormat("Okta account created");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error("Error registering user in Okta for: '{0}'".FormatWith(pmEmailAddress), ex);
+                        //Rollback user activation
+                        _bmsDbUow.Users.RollBackUserActivation(pmUserId);
+                        ModelState.AddModelError("", this.GetString("activation", "lblOktaFault9"));
+                        return Redirect(Url.ActivatePlanMember());
+                    }
+
+                    var passwordResetLink = OktaApiService.CreateTicketPasswordChange(userId) as ContentResult;
+
+                    if (passwordResetLink != null && passwordResetLink.Content != null)
+                    {
+                        passwordChangeURL = passwordResetLink.Content;
+                    }
+                    else
+                    {
+                        _log.InfoFormat("Change password ticket failed");
+                        //Rollback user activation
+                        _bmsDbUow.Users.RollBackUserActivation(pmUserId);
+                    }
+                }
+                // If plan member is eligible for XBS, send XBS activation email
+                if (extraBenefitsEligibilityData.ExtraBenefitsEligibility && sendEmail)
+                {
+                    _activationEmailHelper.SendExtraBenefitsEmail(pmEmailAddress, extraBenefitsEligibilityData, Url);
+                }
+
+                if (sendEmail)
+                {
+                    _activationEmailHelper.SendActivationEmail(pmEmailAddress, model.FirstName + " " + model.LastName, Url, passwordChangeURL);
+                }
+
+                // Redirect user to login and persist username
+                ViewData.Model = new LoginModel { UserName = userIdentity.UserId };
+                ViewBag.SuccessMessage = this.GetString("activation", "lblActivationSuccess").FormatWith(userIdentity.UserId);
+
+                _audit.Log(Constants.AuditCategory.Account, userIdentity.UserId, "PM Activate Account", userIdentity.UserId, "PM user has activated their account", userIdentity.UserId, null);
+
+                return Redirect(Url.Login());
+            }
+
+            return Redirect(Url.ActivatePlanMember());
+        }
+
+        private void UpdateOkta(ref bool sendEmail, UserAccountBrief permission, string oktaUserId, int policyNumber)
+        {
+            //Check roles
+            //When multiple roles exist, PM will take preference meaning Group Metadata will consist of default policy tag.
+            if (permission != null)
+            {
+                if (permission.PolicyCode != null)
+                    policyNumber = Convert.ToInt32(permission.PolicyCode);
+            }
+            //Default Policy will be set to Zero (0) within Group Metadata when only Plan Admin Role exists.
+            else
+            {
+                policyNumber = 0;
+            }
+
+            // Create the base patch operations
+            List<object> patchOperations = new List<object>
+            {
+                new
+                {
+                    op = "replace",
+                    name = "defaultPolicy",
+                    value = policyNumber
+                }
+            };
+
+            // Perform the patch operation
+            var result = OktaApiService.PatchAuth0UserProfile(oktaUserId, patchOperations);
+            _log.InfoFormat("PatchAuth0UserProfile Response: {0}", result.StatusCode);
+
+            if (!result.IsSuccessStatusCode)
+            {
+                switch (result.StatusCode)
+                {
+                    case HttpStatusCode.NotFound when result.ReasonPhrase == "User not bound to application":
+                        var response = OktaApiService.AddGroupAppToMetaData(oktaUserId, policyNumber, null);
+                        _log.InfoFormat("AddGroupAppToMetaData Response: {0}", response.StatusCode);
+
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            _log.Warn($"Trouble updating Okta metadata: {response.StatusCode}");
+                            throw new Exception(response.Content.ToString());
+                        }
+                        break;
+
+                    case HttpStatusCode.BadRequest:
+                        _log.Error("Bad Request: Invalid input.");
+                        throw new Exception("Bad Request: Invalid input.");
+
+                    case HttpStatusCode.Unauthorized:
+                        _log.Error("Unauthorized: Access is denied.");
+                        throw new Exception("Unauthorized: Access is denied.");
+
+                    case HttpStatusCode.Forbidden:
+                        _log.Error("Forbidden: You don't have permission to access this resource.");
+                        throw new Exception("Forbidden: You don't have permission to access this resource.");
+
+                    case HttpStatusCode.InternalServerError:
+                        _log.Error("Internal Server Error: Something went wrong on the server. This could be because Group App was found, but no CertId in the metadata.");
+                        throw new Exception("Internal Server Error: Something went wrong on the server.");
+
+                    default:
+                        _log.Error($"Unexpected error: {result.StatusCode}");
+                        throw new Exception($"Unexpected error: {result.StatusCode}");
+                }
+            }
+            else
+            {
+                sendEmail = false;
+            }
+        }
+
+        //
+        // GET: /Account/ActivatePlanAdmin
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult ActivatePlanAdmin()
+        {
+            TempData["Page"] = "PlanAdmin";
+            var model = ViewData.Model as ActivatePlanAdminModel ?? new ActivatePlanAdminModel();
+
+            return View(model);
+        }
+
+        //
+        // POST: /Account/ActivatePlanAdmin
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ExportViewDataToTempData]
+        public ActionResult ActivatePlanAdmin(ActivatePlanAdminModel model)
+        {
+            TempData["Page"] = "PlanAdmin";
+            return ActivatePlanAdminOrAdvisor(model) ?? Redirect(Url.ActivatePlanAdmin());
+        }
+
+        //
+        // GET: /Account/ActivatePlanAdvisor
+
+        [HttpGet]
+        [AllowAnonymous]
+        [ImportViewDataFromTempData]
+        public ActionResult ActivatePlanAdvisor()
+        {
+            TempData["Page"] = "PlanAdvisor";
+            var model = ViewData.Model as ActivatePlanAdvisorModel ?? new ActivatePlanAdvisorModel();
+
+            return View(model);
+        }
+
+        //
+        // POST: /Account/ActivatePlanAdvisor
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ExportViewDataToTempData]
+        public ActionResult ActivatePlanAdvisor(ActivatePlanAdvisorModel model)
+        {
+            TempData["Page"] = "PlanAdvisor";
+            return ActivatePlanAdminOrAdvisor(model) ?? Redirect(Url.ActivatePlanAdvisor());
+        }
+
+        [HttpPost]
+        [AllowAnonymous]
+        [ExportViewDataToTempData]
+        public String UpdateEmail(string userName, string email)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(userName))
+                {
+                    return "Username-Empty";
+                }
+
+                if (string.IsNullOrEmpty(email))
+                {
+                    return "Email-Empty";
+                }
+
+                _bmsDbUow.Users.UpdateUserEmail(userName, email);
+                return "Updated";
+            }
+            catch (Exception ex)
+            {
+                _log.InfoFormat("Error updating email", ex);
+                return ex.Message;
+            }
+        }
+
+        /// <summary>
+        /// Activation code for both admin and advisors
+        /// </summary>
+        private ActionResult ActivatePlanAdminOrAdvisor(ActivatePlanAdminOrAdvisorModelBase model)
+        {
+            if (ModelState.IsValid)
+            {
+                _log.InfoFormat("Plan admin/advisor is trying to activate account. Username: {0}", model.UserName);
+
+                UserCredentials credentials = _bmsDbUow.Users.GetCredentials(model.UserName);
+                UserProfile profile = _bmsDbUow.Users.GetUserProfile(credentials.UserId);
+                var emailAddress = profile.Email;
+                if (String.IsNullOrEmpty(emailAddress) && String.IsNullOrEmpty(model.Email))
+                {
+                    _log.InfoFormat("No email on file - prompting user to enter one.");
+                    TempData["ShowModal"] = true;
+                    if (TempData["Page"].ToString() == "PlanAdmin")
+                    {
+                        return Redirect(Url.ActivatePlanAdmin());
+                    }
+                    else if (TempData["Page"].ToString() == "PlanAdvisor")
+                    {
+                        return Redirect(Url.ActivatePlanAdvisor());
+                    }
+                }
+
+                //if hidden email is not null then set emailAddress to the hidden email from the model
+                if (!string.IsNullOrEmpty(model.Email))
+                {
+                    emailAddress = model.Email;
+                }
+
+                //Continue with Account Activation process.
+                //System will enforce existing account activation rules and when successful
+                //activate Plan Admin account in BMS and (Save new email address when provided on email pop-up).
+
+                if (credentials == null) // User not found
+                {
+                    _log.Warn("Plan admin/advisor account could not be activated because it did not match up with an identity.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblErrorInvalidCredentials"));
+                    return null;
+                }
+
+                if (credentials.IsLockedOut)
+                {
+                    _log.Warn("Plan admin/advisor account could not be activated because it is currently locked out.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblErrorAccountLocked").FormatWith(_settings.AccountLockoutTimeInMinutes));
+                    return null;
+                }
+
+                if (credentials.Status != EQ.EquitableHealth.Data.Bms.DomainObjects.UserStatus.NewStatus)
+                {
+                    _log.Warn("Plan admin/advisor account could not be activated because its status is not New.");
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountAlreadyActiveError"));
+                    return null;
+                }
+
+                if (model.TempPassword != credentials.HashedPassword) // temp passwords aren't hashed
+                {
+                    _log.Warn("Plan admin/advisor account could not be activated because the provided password is not correct.");
+
+                    // Password was wrong so either lockout the account or increment failed login/activation count
+                    if (credentials.LogonFailCount >= 3)
+                    {
+                        var lockOutDateTime = credentials.SystemDateTime.AddMinutes(_settings.AccountLockoutTimeInMinutes);
+                        _bmsDbUow.Users.UpdateCredentialsLockAccount(credentials.UserId, lockOutDateTime);
+
+                        _log.Warn("LogonFailCount limit reached, locking account");
+                        ModelState.AddModelError("", this.GetString("activation", "lblErrorAccountLocked").FormatWith(_settings.AccountLockoutTimeInMinutes));
+                        return null;
+                    }
+
+                    _bmsDbUow.Users.UpdateCredentialsFailedLogin(credentials.UserId, (short)(credentials.LogonFailCount + 1));
+
+                    ModelState.AddModelError("", this.GetString("activation", "lblErrorInvalidCredentials"));
+                    return null;
+                }
+
+                try
+                {
+                    var sendEmail = true;
+                    // Call service to activate account
+                    _userService.ActivateAccount(new ActivateAccountRequest
+                    {
+                        UserId = credentials.UserId,
+                        Language = Culture.Current.TwoLetterISOLanguageName,
+                        Email = emailAddress,
+                        ChallengeQuestion = "",
+                        ChallengeResponse = ""
+                    });
+
+
+                    _log.Info("Plan admin/advisor account activated successfully, registering on OKTA.");
+
+                    var changePasswordUrl = RegisterUserOnOkta(ref sendEmail, model, profile);
+                    if (changePasswordUrl.IsNullOrEmpty())
+                    {
+                        _log.InfoFormat("Change password ticket failed");
+                        return Redirect(Url.Login());
+                    }
+
+                    _log.Info("Okta registered successfully, sending activation email.");
+                    //Only Send Email if New Okta User
+                    if (sendEmail)
+                    {
+                        _activationEmailHelper.SendActivationEmail(emailAddress, profile.ContactName, Url, changePasswordUrl);
+                    }
+
+                    // Redirect user to login and persist username
+                    ViewData.Model = new LoginModel { UserName = credentials.UserId };
+                    ViewBag.SuccessMessage = this.GetString("activation", "lblActivationSuccess").FormatWith(credentials.UserId);
+
+                    _audit.Log(Constants.AuditCategory.Account, credentials.UserId, "PA Activate Account", credentials.UserId, "PA user has activated an account", credentials.UserId, null);
+
+                    return Redirect(Url.Login());
+                }
+                catch (FaultException<InvalidUserFault> exc)
+                {
+                    _log.Info("CoreWS returned invalid user fault when activating admin/advisor account", exc);
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountNotFoundError"));
+                    return null;
+                }
+                catch (FaultException<InvalidUserStatusFault> exc)
+                {
+                    _log.Info("CoreWS returned invalid user status fault when activating admin/advisor account", exc);
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountNotNewError"));
+                    return null;
+                }
+                catch (FaultException<LockFault> exc)
+                {
+                    _log.Info("CoreWS returned lock fault when activating admin/advisor account", exc);
+                    ModelState.AddModelError("", this.GetString("activation", "lblAccountLockError"));
+                    return null;
+                }
+                catch (Exception ex)
+                {
+                    //Check for OKTA Duplicate Email Errors (OKTA1, OKTA2 or OKTA9) and return the OKTA error back
+                    var OKTAErrCode = ex.Message;
+                    if (OKTAErrCode.IndexOf("OKTA") != -1)
+                    {
+                        OKTAErrCode = OKTAErrCode.Substring(OKTAErrCode.IndexOf("OKTA"), 5);
+                        if (OKTAErrCode == "OKTA1")
+                        {
+                            ModelState.AddModelError("", this.GetString("activation", "lblOktaFault1"));
+                        }
+                        else if (OKTAErrCode == "OKTA2")
+                        {
+                            ModelState.AddModelError("", this.GetString("activation", "lblOktaFault2"));
+                        }
+                        else
+                        {
+                            ModelState.AddModelError("", this.GetString("activation", "lblOktaFault9"));
+                        }
+                        _log.InfoFormat("OKTA Error - prompting user to enter new email.");
+                        TempData["ShowModal"] = true;
+                        if (TempData["Page"].ToString() == "PlanAdmin")
+                        {
+                            return Redirect(Url.ActivatePlanAdmin());
+                        }
+                        else if (TempData["Page"].ToString() == "PlanAdvisor")
+                        {
+                            return Redirect(Url.ActivatePlanAdvisor());
+                        }
+                    }
+                    else
+                    {
+                        // Log the exception details
+                        _log.Warn("caught in my custom catch: ", ex);
+                        throw new FaultException("An error occurred while processing your request.");
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private string RegisterUserOnOkta(ref bool sendEmail, ActivatePlanAdminOrAdvisorModelBase model, UserProfile profile)
+        {
+            var email = profile.Email;
+            try
+            {
+                //if BMS email is null then set email to the hidden email field from the model
+                if (string.IsNullOrEmpty(profile.Email))
+                {
+                    email = model.Email;
+                }
+                var passwordChangeURL = string.Empty;
+
+                // Get User Permisssions to check for multiple roles
+                UserAccountBrief permission = _bmsDbUow.Users.GetUserPermission(email);
+
+                // System invokes Okta user search API (to determine if they are already an OKTA user).
+                var actionResult = OktaApiService.SearchOktaUserByEmail(email);
+                var contentResult = actionResult as ContentResult;
+                var oktaUserId = contentResult?.Content;
+
+                if (!string.IsNullOrEmpty(oktaUserId))
+                {
+                    try
+                    {
+                        _log.InfoFormat("Okta account was found! {0}", oktaUserId);
+                        UpdateOkta(ref sendEmail, permission, oktaUserId, 0);
+                        _log.InfoFormat("Okta account created");
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error("Error updating user in Okta for: '{0}'".FormatWith(email), ex);
+                        //Rollback user activation
+                        UserCredentials credentials = _bmsDbUow.Users.GetCredentials(model.UserName);
+                        _bmsDbUow.Users.RollBackUserActivation(credentials.UserId);
+                        throw new FaultException("An error occurred while registering OKTA Account.");
+                    }
+                }
+                else
+                {
+                    //System invokes User Onboarding API to either update existing OKTA account based on email address \
+                    //(add the form inputs to OKTA metadata) or create a new OKTA account.
+                    // Okta account not found?, Create one
+                    var name = profile.ContactName;
+                    string[] nameParts = name.Split(' ');
+                    string firstName = nameParts[0];
+                    string lastName = nameParts[nameParts.Length - 1];
+                    var response = OktaApiService.CreateNewOktaUser(permission, email, firstName, lastName, name, 0);
+                    oktaUserId = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    _log.InfoFormat("Okta account created: {0}", oktaUserId);
+                }
+                // Generate password reset link for the email
+                var passwordResetLink = OktaApiService.CreateTicketPasswordChange(oktaUserId) as ContentResult;
+
+                if (passwordResetLink != null)
+                {
+                    passwordChangeURL = passwordResetLink.Content;
+                }
+                else
+                {
+                    _log.InfoFormat("Change password ticket failed: {0}", passwordResetLink);
+                    //Rollback user activation
+                    UserCredentials credentials = _bmsDbUow.Users.GetCredentials(model.UserName);
+                    _bmsDbUow.Users.RollBackUserActivation(credentials.UserId);
+                    throw new Exception("Change password ticket failed.");
+                }
+
+                return passwordChangeURL;
+            }
+            catch (Exception ex)
+            {
+                _log.Error("Error registering user in Okta for: '{0}'".FormatWith(email), ex);
+                //Rollback user activation
+                UserCredentials credentials = _bmsDbUow.Users.GetCredentials(model.UserName);
+                _bmsDbUow.Users.RollBackUserActivation(credentials.UserId);
+                throw new FaultException("An error occurred while registering OKTA Account.");
+            }
+        }
+
+        private void SendUntrustedDeviceEmail(string username)
+        {
+            var userProfile = _bmsDbUow.Users.GetUserProfile(username);
+
+            if (userProfile != null && !string.IsNullOrEmpty(userProfile.Email))
+            {
+                var templateContext = new Dictionary<string, object>
+                                        {
+                                            {"logoUrl", Url.EqLogoUrl()},
+                                            {"loginUrl", Url.ToAbsolute(Url.Login())},
+                                            {"username", username}
+                                        };
+
+                var subject = _templateEngine.Run(string.Format(Constants.Templates.UntrustedDeviceEmailSubject, Culture.Current.TwoLetterISOLanguageName), templateContext);
+                var body = _templateEngine.Run(string.Format(Constants.Templates.UntrustedDeviceEmailBody, Culture.Current.TwoLetterISOLanguageName), templateContext);
+
+                var email = new SendRequest
+                {
+                    Subject = subject,
+                    Source = _settings.ApplicationName,
+                    From = _settings.NoReplyEmail,
+                    To = new[] { new Recipient { EmailAddress = userProfile.Email } },
+                    Body = body,
+                    IsBodyHtml = true,
+                    SendImmediately = true,
+                    MailerApiKey = _settings.MandrillMailerApiKey
+                };
+
+                _log.Info(string.Format("Sending untrusted device email to {0}", userProfile.Email));
+                _emailService.Send(email);
+            }
+        }
+
+        //
+        // GET: /Account/LogOff
+
+        [AllowAnonymous]
+        public ActionResult LogOff()
+        {
+            if (User.Identity.IsAuthenticated)
+            {
+                _formsAuthentication.SignOut();
+
+                //Clear session
+                Session.Clear();
+                Session.Abandon();
+
+                HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+                HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
+            }
+
+            Session.Clear();
+
+            if (Request.IsAjaxRequest())
+            {
+                var result = new GenericJsonModel();
+                return this.JsonNet(result);
+            }
+
+            return RedirectToAction("Index", "Home");
+        }
+
+        //
+        // GET: /Account/Language
+
+        [AllowAnonymous]
+        public ActionResult Language(string choice, string returnUrl)
+        {
+            if (string.IsNullOrWhiteSpace(choice) || !Constants.AllowedLanguageCodes.Contains(choice))
+            {
+                choice = Culture.Current.TwoLetterISOLanguageName;  // use current
+            }
+
+            var cookie = new HttpCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Language, choice);
+            cookie.Expires = DateTime.Now.AddYears(1);
+            Response.Cookies.Add(cookie);
+
+            if (Request.IsAjaxRequest())
+            {
+                return this.JsonNet(new { Language = choice });
+            }
+
+            if (!string.IsNullOrEmpty(returnUrl))
+                return Redirect(returnUrl);
+
+            if (Request.UrlReferrer != null)
+            {
+                var pathAndQuery = Request.UrlReferrer.PathAndQuery;
+
+                pathAndQuery = choice == "fr" ?
+                    pathAndQuery.Replace("/en/", "/fr/") :
+                    pathAndQuery.Replace("/fr/", "/en/");
+
+                if (Url.IsLocalUrl(pathAndQuery))
+                {
+                    return Redirect(pathAndQuery);
+                }
+            }
+
+            return Redirect(Url.Home());
+        }
+
+        private void SetTrustMachineCookie(string userName)
+        {
+            var trustedMachineCookie = Request.Cookies[TrustedMachineCookieName] ?? new HttpCookie(TrustedMachineCookieName);
+            var hashedUserName = userName.ToLower().Hash();
+            var hashedAndEncodedUserName = HttpUtility.UrlEncode(hashedUserName);
+
+            trustedMachineCookie.Expires = SystemTime.Now().AddYears(1);
+            trustedMachineCookie[hashedAndEncodedUserName] = GetCurrentMachineHash(userName);
+
+            Response.Cookies.Add(trustedMachineCookie);
+        }
+
+        private ActionResult SignInAndRedirect(string userName, string returnUrl = null,
+            bool respondWithJson = false, string responseMessage = null,
+            IDictionary<string, string> additionalLoginDetails = null, LoginModel model = null)
+        {
+            _formsAuthentication.SignIn(userName, false);
+
+            var credentials = _bmsDbUow.Users.GetCredentials(userName);
+            var redirectToTrustDevice = false;
+
+            if (model != null && model.Fingerprint != null)
+            {
+                // Check if Fingerprint exists 
+                if (!_bmsDbUow.Users.ValidateUserFingerPrint(model.UserName, model.Fingerprint))
+                    redirectToTrustDevice = true;
+            }
+            else
+            {
+                // Do we need to ask security question?
+                if (GetCurrentMachineHash(userName) != GetTrustedMachineHash(userName))
+                    redirectToTrustDevice = true;
+            }
+
+
+            _audit.Log(Constants.AuditCategory.Account, userName, "User Logged In", credentials.UserId, "User has logged in", credentials.UserId, null);
+            _loginLogger.Log(_settings.ApplicationName, credentials.UserId, DateTime.UtcNow, Request.UserHostAddress, Request.UserAgent, additionalLoginDetails);
+
+            if (User.IsPm())
+            {
+                _bmsDbUow.Policies.GetPolicyList(credentials.UserId, WebRole.PlanMember, true);
+            }
+
+            if (respondWithJson)
+            {
+                if (model.IsMobile())
+                {
+                    if (model.SendUntrustedMobileNotification)
+                    {
+                        SendUntrustedDeviceEmail(userName);
+                    }
+                }
+
+                var userProfile = _bmsDbUow.Users.GetUserProfile(credentials.UserId);
+                return this.JsonNet(new LoginJsonModel
+                {
+                    UserId = credentials.UserId,
+                    UserRoles = User.GetWebRoles().Select(r => r.ToString()).ToArray(),
+                    ContactName = userProfile.ContactName,
+                    Message = responseMessage
+                });
+            }
+
+            if (User.IsPm() && credentials.IsFlexUser)
+            {
+                var windowResponse = _flexService.GetEnrolmentWindows(new GetEnrolmentWindowsRequest
+                {
+                    UserId = User.Identity.Name,
+                    Language = Culture.Current.TwoLetterISOLanguageName,
+                });
+
+                if (windowResponse.EnrolmentWindows.Any())
+                {
+                    if (redirectToTrustDevice)
+                    {
+                        SendUntrustedDeviceEmail(userName);
+                        return RedirectToAction("TrustDevice", new { redirectUrl = Url.PmFlexEnrolments(returnUrl), userName = userName });
+                    }
+
+                    return Redirect(Url.PmFlexEnrolments(returnUrl));
+                }
+            }
+
+            if (redirectToTrustDevice)
+            {
+                SendUntrustedDeviceEmail(userName);
+                return RedirectToAction("TrustDevice", new { redirectUrl = Url.Home(returnUrl), userName = userName });
+            }
+
+            return Redirect(Url.Home(returnUrl));
+        }
+
+        [HttpGet]
+        public ViewResult TrustDevice(string username, string redirectUrl)
+        {
+            TrustDeviceModel model = new TrustDeviceModel()
+            {
+                Username = username,
+                RedirectUrl = redirectUrl
+            };
+
+            return View(model);
+        }
+
+        [HttpPost]
+        public RedirectResult TrustDevice(TrustDeviceModel model)
+        {
+            if (model.TrustDevice)
+            {
+                if (model.Fingerprint != null)
+                {
+                    // Update User FingerPrint
+                    _bmsDbUow.Users.UpdateUserFingerPrint(model.Username, model.Fingerprint);
+                }
+                else
+                {
+                    SetTrustMachineCookie(model.Username);
+                }
+            }
+
+            return Redirect(model.RedirectUrl);
+        }
+
+
+
+
+
+        //
+        // POST: /Account/GetUserEmail
+
+        [HttpPost]
+        [AllowAnonymous]
+        public string GetUserEmail(string userId)
+        {
+            var email = _bmsDbUow.Users.GetUserEmail(userId);
+
+            return email;
+        }
+
+        private void ValidateMobileVersion(LoginModel model)
+        {
+            var appVersion = model.AppVersion;
+            var platform = model.Platform;
+            var appVersionSupport = _ezClaimLookupDbUow.EzClaimLookup.GetEzClaimAppSupportDetails()
+                .FirstOrDefault(x => x.AppVersion == appVersion && x.Platform == platform);
+
+            // Check if mobile version is out of support
+            if (appVersionSupport != null && DateTime.Now >= appVersionSupport.EndDate)
+            {
+                // Past expiration date of mobile version so return error message
+                var currentVersion = new Version(model.AppVersion);
+                var versionWithHtmlSupport = new Version(Constants.MobileAppVersions.HtmlSupportMinVersion);
+
+                var errorMessage = currentVersion.CompareTo(versionWithHtmlSupport) < 0
+                    ? this.GetString("login", "lblAppVersionLockoutLegacy")
+                    : this.GetString("login", "lblAppVersionLockout{0}".FormatWith(platform));
+
+                ModelState.AddModelError("", errorMessage);
+
+                _log.InfoFormat("User {0} attempted to log in with app version {1}, which is no longer supported. OS platform: {2}", model.UserName, appVersion, platform);
+            }
+        }
+
+        private string GetMobileVersionWarning(LoginModel model)
+        {
+            // Check if app version is nearing end of life
+            var appVersionSupport = _ezClaimLookupDbUow.EzClaimLookup.GetEzClaimAppSupportDetails()
+                .FirstOrDefault(x => x.AppVersion == model.AppVersion && x.Platform == model.Platform);
+
+            if (appVersionSupport != null)
+            {
+                var warnDate = appVersionSupport.EndDate.AddDays(-_settings.AppVersionLockoutWarningInDays);
+
+                if (DateTime.Now >= warnDate)
+                {
+                    // Past warn date so include a message with login response
+                    return this.GetString("login", "lblAppVersionWarning{0}".FormatWith(model.Platform)).FormatWith(appVersionSupport.EndDate.ToShortDateString());
+                }
+            }
+
+            return null;  // No warning message necessary
+        }
+
+
+
+        private string GetCurrentMachineHash(string userName)
+        {
+            var currentMachineToken = TrustedMachineTokenFormat.FormatWith(userName.ToLower(),
+                                                                           Request.UserAgent);
+            return currentMachineToken.Hash();
+        }
+
+        private string GetTrustedMachineHash(string userName)
+        {
+            var trustedMachineCookie = Request.Cookies[TrustedMachineCookieName];
+
+            if (trustedMachineCookie != null)
+            {
+                var hashedUserName = userName.ToLower().Hash();
+                var hashedAndEncodedUserName = HttpUtility.UrlEncode(hashedUserName);
+                return trustedMachineCookie[hashedAndEncodedUserName];
+            }
+
+            return null;
+        }
+
+        private static string EncryptPin(string userId, string pin)
+        {
+            var token = userId + "|" + pin;
+            return EQ.EquitableHealth.Cryptography.Encryption.EncryptAESToBase64(token, Constants.PinEncryptionKey);
+        }
+
+
+    }
+}
+
+====
+using EQ.EquitableHealth.Web;
+using System.Net;
+using System;
+using System.Web;
+using System.Web.Security;
+using Microsoft.Owin.Security.Cookies;
+using EQ.Health.Web.Helpers;
+using Equitable.EquitableHealth.Web.Models;
+using EQ.EquitableHealth.Logging;
+using Equitable.EquitableHealth.Web.Controllers;
+using EQ.ApplicationLogins;
+using log4net;
+using Org.BouncyCastle.Asn1.Ocsp;
+using Microsoft.Owin;
+
+namespace Equitable.EquitableHealth.Web
+{
+    public class Auth0SessionModule : IHttpModule
+    {
+        private static readonly ILog log = LogManager.GetLogger(typeof(Auth0SessionModule));
+
+        public void Init(HttpApplication app)
+        {
+            app.PostAcquireRequestState += OnPostAcquireRequestState;
+            app.AuthenticateRequest += OnAuthenticateRequest; // Added to check authentication early
+        }
+
+        private void OnAuthenticateRequest(object sender, EventArgs e)
+        {
+            var app = sender as HttpApplication;
+            if (app == null) return;
+
+            var request = app.Context.Request;
+            var response = app.Context.Response;
+
+            //Check for redirect loop by counting redirects
+            var redirectCountCookie = request.Cookies["RedirectCount"];
+            int redirectCount = 0;
+
+            if (redirectCountCookie != null)
+            {
+                int.TryParse(redirectCountCookie.Value, out redirectCount);
+            }
+            //If too many redirects, clear everything and go to a safe page
+            if (redirectCount > 10)
+            {
+                foreach (string cookieName in request.Cookies.AllKeys)
+                {
+                    var cookie = new HttpCookie(cookieName)
+                    {
+                        Expires = DateTime.Now.AddDays(-1),
+                        Domain = FormsAuthentication.CookieDomain
+                    };
+                    response.Cookies.Add(cookie);
+                }
+
+                //Reset redirect counter
+                response.Cookies.Add(new HttpCookie("RedirectCount", "0"));
+
+                //Send to login page with special parameter
+                response.Redirect("/Account/Index/reset=true", false);
+                app.CompleteRequest();
+                return;
+            }
+
+            //Increment redirect counter on potential redirect situations
+            if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()) == false &&
+                request.Cookies[FormsAuthentication.FormsCookieName] == null)
+            {
+                response.Cookies.Add(new HttpCookie("RedirectCount", (redirectCount+1).ToString()));
+            }
+            else
+            {
+                response.Cookies.Add(new HttpCookie("RedirectCount","0"));
+            }
+
+            // Skip for specific paths
+            if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()))
+                return;
+
+            // Check for login page - ensure we don't show authenticated header on login page
+            if (request.Path.ToLowerInvariant().Contains("/account/index") ||
+                request.Path.ToLowerInvariant().Contains("/account/login"))
+            {
+                // Check if we have a valid timestamp cookie but no auth cookie
+                var timestampCookie = request.Cookies["SessionTimestamp"];
+                var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
+
+                if (timestampCookie != null && authCookie == null)
+                {
+                    // User has logged out in another tab but timestamp still exists
+                    // Clear it to ensure login page shows unauthenticated state
+                    var expiredCookie = new HttpCookie("SessionTimestamp") { Expires = DateTime.Now.AddDays(-1) };
+                    response.Cookies.Add(expiredCookie);
                 }
             }
         }
-        catch
+
+        private void OnPostAcquireRequestState(object sender, EventArgs e)
         {
-            // Continue with request if there's any error
-        }
-    }
+            var app = sender as HttpApplication;
+            if (app == null)
+                return;
 
-    public void Dispose() { }
-}
-```
+            var request = app.Context.Request;
 
-Register this module in your web.config:
+            if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()))
+                return;
 
-```xml
-<add name="UserSwitchDetectionModule" type="Equitable.EquitableHealth.Web.UserSwitchDetectionModule, Equitable.EquitableHealth.Web" />
-```
+            //Check for Mobile token
+            if (!string.IsNullOrEmpty(request.Headers["Authorization"]))
+            {
+                log.Info("Auth0SessionModule" + "Authorization Success");
+                return;
+            }
 
-**What this solution does:**
+            //Regular website flow remains unchanged.
+            var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
+            var timestampCookie = request.Cookies["SessionTimestamp"];
 
-1. Tracks the currently active user in session state
-2. Compares that to the user in the authentication cookie on each request
-3. If they're different (user switched in another tab), it forces a complete page reload
-4. For AJAX requests, it adds a special header the client could detect
-
-This ensures that when you switch from Plan Member to Plan Admin in one tab, other tabs will detect the change and reload with the correct permissions and interface.
-
-Additionally, you could consider adding a small JavaScript function to periodically check if the authentication has changed. Include this in your layout or master page:
-
-```javascript
-// Check user session every 30 seconds
-function checkUserSession() {
-    fetch('/api/session/check', { 
-        credentials: 'include',  // Include cookies
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
-    })
-    .then(response => {
-        // If status indicates user change, reload the page
-        if (response.headers.get('X-User-Changed') === 'true') {
-            window.location.reload();
-        }
-    })
-    .catch(() => {
-        // Silently fail - will try again later
-    });
-    
-    setTimeout(checkUserSession, 30000); // Check every 30 seconds
-}
-
-// Start checking
-checkUserSession();
-```
-
-This approach gives you the most comprehensive solution for multi-tab synchronization while requiring minimal changes to your existing code.
-
-===========
-The order of HTTP modules is important since they process requests in sequence. For your authentication modules, the optimal order would be:
-
-1. **Auth0SessionModule** - Should run first to validate basic authentication state and handle redirects for unauthenticated requests
-2. **LogoutCookieModule** - Should run next to intercept and properly handle logout requests 
-3. **UserSwitchDetectionModule** - Should run after authentication is verified but before user identity is fully established
-4. **BMSSessionModule** - Should run last to set up the final user identity and update activity timestamps
-
-In your web.config, the modules section should look like this:
-
-```xml
-<httpModules>
-  <add name="SuppressFormsAuthRedirectModule" type="Equitable.EquitableHealth.Web.SuppressFormsAuthRedirectModule, Equitable.EquitableHealth.Web" />
-  <add name="Localization" type="Equitable.EquitableHealth.Web.LocalizationModule, Equitable.EquitableHealth.Web" />
-  <add name="Auth0SessionModule" type="Equitable.EquitableHealth.Web.Auth0SessionModule, Equitable.EquitableHealth.Web" />
-  <add name="LogoutCookieModule" type="Equitable.EquitableHealth.Web.LogoutCookieModule, Equitable.EquitableHealth.Web" />
-  <add name="UserSwitchDetectionModule" type="Equitable.EquitableHealth.Web.UserSwitchDetectionModule, Equitable.EquitableHealth.Web" />
-  <add name="BmsSession" type="Equitable.EquitableHealth.Web.BmsSessionModule, Equitable.EquitableHealth.Web" />
-  <add name="CustomErrors" type="Equitable.EquitableHealth.Web.ErrorModule, Equitable.EquitableHealth.Web" />
-</httpModules>
-```
-
-This order ensures:
-
-1. Auth0 authentication is verified first
-2. Logout handling is consistent
-3. User switches are detected before session state is finalized
-4. BMS session is updated last with the correct identity
-
-You should also make sure each module properly hooks into the right event in the ASP.NET pipeline:
-
-- Auth0SessionModule: PostAcquireRequestState, AuthenticateRequest
-- LogoutCookieModule: EndRequest (to catch all logout attempts)
-- UserSwitchDetectionModule: PreRequestHandlerExecute (after auth but before page execution)
-- BMSSessionModule: PostAuthorizeRequest (final identity setup)
-
-This ordering ensures a smooth flow of authentication processing and should handle all your edge cases correctly.
-==============
-This is an interesting issue with your mobile authentication flow. Let's analyze what's happening:
-
-1. Mobile app redirects to Auth0 login
-2. After login, mobile app calls `/Account/UserInfo` with a Bearer token
-3. `/Account/UserInfo` validates the token, calls `FormsAuthentication.SignIn()` and returns JSON
-4. Then the mobile app calls `DataController/Certificate` with the same Bearer token
-5. `AppAuthorize` recognizes the Bearer token and returns true
-6. But instead of proceeding to the Certificate endpoint, it redirects to Auth0's `/authorize` endpoint with the web application's client ID
-
-This suggests that while your initial Bearer token authentication in `UserInfo` is successful, something is causing the session to be invalidated or not properly maintained for the subsequent `Certificate` call.
-
-The main issue appears to be a mismatch between how you're handling Bearer token authentication across different endpoints. Here's what's likely happening:
-
-1. Your `AppAuthorize` attribute correctly detects the Bearer token and returns true
-2. But somewhere in the pipeline after that, another authentication check is failing
-3. This could be happening in one of your HTTP modules like `Auth0SessionModule` or `BmsSessionModule`
-
-Let's modify the `Auth0SessionModule` to better handle mobile token requests:
-
-```csharp
-private void OnPostAcquireRequestState(object sender, EventArgs e)
-{
-    var app = sender as HttpApplication;
-    if (app == null)
-        return;
-
-    var request = app.Context.Request;
-
-    if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()))
-        return;
-
-    // Check for Mobile token - ENHANCED MOBILE TOKEN HANDLING
-    if (!string.IsNullOrEmpty(request.Headers["Authorization"]))
-    {
-        var authHeader = request.Headers["Authorization"];
-        if (authHeader.StartsWith("Bearer"))
-        {
-            try {
-                // Verify we have a valid token
-                var token = authHeader.Substring("Bearer".Length).Trim();
-                var handler = new JwtSecurityTokenHandler();
-                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
-                
-                if (jsonToken != null)
+            //Case 1: No BMSWebAuthCookie - Need complete authentication
+            if (authCookie == null)
+            {
+                //Skip redirect if already on Auth0 callback or login process
+                if (AuthenticationHelper.ShouldSkipPages(request.Path.ToLowerInvariant()))
                 {
-                    // If token is valid, ensure we have proper user identity
-                    if (!app.Context.User.Identity.IsAuthenticated)
-                    {
-                        // Get email from token
-                        var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "name" || 
-                                                                         c.Type == "email")?.Value;
-                        
-                        if (!string.IsNullOrEmpty(email))
-                        {
-                            // Look up user
-                            var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
-                            string userId = bmsDbUow.Users.GetUserIdFromEmailAddress(email);
-                            
-                            if (!string.IsNullOrEmpty(userId))
-                            {
-                                // Set up user identity
-                                var identity = new GenericIdentity(userId, "Bearer");
-                                app.Context.User = new GenericPrincipal(identity, new string[0]);
-                            }
-                        }
-                    }
-                    
-                    // We have a valid token, skip further authentication checks
-                    log.Info("Mobile Bearer token authentication successful");
+                    return;
+                }
+                if (!app.Context.Request.Path.ToLowerInvariant().Contains("/account/login"))
+                {
+                    RedirectToAuth0(app.Context);
                     return;
                 }
             }
-            catch (Exception ex) {
-                log.Error("Error validating mobile token", ex);
-                // Continue with normal auth flow if token validation fails
-            }
-        }
-    }
 
-    // Regular authentication flow continues...
-}
-```
-
-Also modify `BmsSessionModule` to be more mobile-friendly:
-
-```csharp
-private void Application_PostAuthorizeRequest(object source, EventArgs e)
-{
-    const string legacyThrottleDateFormat = "MM/dd/yyyy HH:mm:ss";
-    var app = source as HttpApplication;
-    if (app == null) return;
-
-    // Check for Mobile token with improved handling
-    var authHeader = app.Context.Request.Headers["Authorization"];
-    if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer"))
-    {
-        log.Info("BmsSessionModule - Authorization header detected");
-        
-        // For mobile requests, make sure user identity is set up
-        if (app.Context.User?.Identity?.IsAuthenticated != true)
-        {
-            try {
-                // Parse token to get user info
-                var token = authHeader.Substring("Bearer".Length).Trim();
-                var handler = new JwtSecurityTokenHandler();
-                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
-                
-                if (jsonToken != null)
+            try
+            {
+                // If we have auth cookie but no timestamp cookie, something is wrong
+                // This covers the case where a user logs in in another tab
+                if (authCookie != null && timestampCookie == null && !AuthenticationHelper.ShouldSkipPages(request.Path.ToLowerInvariant()))
                 {
-                    var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "name" || 
-                                                                     c.Type == "email")?.Value;
-                    
-                    if (!string.IsNullOrEmpty(email))
+                    ClearAuthenticationState(app.Context);
+                    RedirectToAuth0(app.Context);
+                    return;
+                }
+
+                if (authCookie != null)
+                {
+                    var authCookieInfo = new AuthCookieInfo(authCookie);
+
+                    //Creating a variable to hold the TrueClientIP value from the current request object's header
+                    string TrueClientIP = EQ.EquitableHealth.Web.Constants.CookieNames.TrueClientIP;
+
+                    if (request.Headers["True-Client-IP"] != null)
                     {
-                        // Look up user
-                        var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
-                        string userId = bmsDbUow.Users.GetUserIdFromEmailAddress(email);
-                        
-                        if (!string.IsNullOrEmpty(userId))
+                        TrueClientIP = request.Headers["True-Client-IP"];
+                    }
+
+                    //Case 2: Cookie exists but authentication failed or user agent or host address changed
+                    if (authCookieInfo.IsAuthenticated && TrueClientIP != authCookieInfo.TrueClientIP)
+                    {
+                        var response = app.Context.Response;
+
+                        // Kill all cookies, abandon session and return unauthorized
+                        foreach (string cookieName in request.Cookies.AllKeys)
                         {
-                            // Get user roles
-                            var userProfileRoles = bmsDbUow.Users.GetProfileRoles(userId);
-                            
-                            // Set up identity with roles
-                            var identity = new GenericIdentity(userId, "Bearer");
-                            app.Context.User = new GenericPrincipal(identity, userProfileRoles.WebRoles);
-                            
-                            log.Info($"BmsSessionModule - Set up user identity for mobile user: {userId}");
+                            if (cookieName == "Language")
+                            {
+                                continue;
+                            }
+
+                            HttpCookie cookie = request.Cookies[cookieName];
+
+                            if (cookie == null)
+                            {
+                                continue;
+                            }
+
+                            cookie.Expires = DateTime.Now.AddYears(-1);
+
+                            if (cookieName == FormsAuthentication.FormsCookieName)
+                            {
+                                cookie.Domain = FormsAuthentication.CookieDomain;
+                            }
+
+                            response.SetCookie(cookie);
+                        }
+
+                        var session = app.Context.Session;
+                        if (session != null)
+                        {
+                            session.Clear();
+                            session.Abandon();
+                        }
+
+                        response.StatusCode = (int)HttpStatusCode.Unauthorized;
+                        response.StatusDescription = "Unauthorized";
+                        response.End();
+
+                        //Sign out of Auth0
+                        app.Context.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+                        app.Context.GetOwinContext().Authentication.SignOut("Auth0");
+                        RedirectToAuth0(app.Context);
+                        return;
+                    }
+
+                    if (!app.Context.Request.Path.ToLowerInvariant().Contains("/account/login"))
+                    {
+                        //Case 3: When Formsauthentication ticket expire
+                        try
+                        {
+                            var ticket = FormsAuthentication.Decrypt(authCookie.Value);
+                            if (ticket.Expired)
+                            {
+                                ClearAuthenticationState(app.Context);
+                                RedirectToAuth0(app.Context);
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log.Error("Error decrypting FormsAuthentication ticket", ex);
+                            ClearAuthenticationState(app.Context);
+                            RedirectToAuth0(app.Context);
+                            return;
                         }
                     }
                 }
             }
-            catch (Exception ex) {
-                log.Error("Error setting up mobile user identity", ex);
-            }
-        }
-        
-        return;
-    }
-    
-    // Regular web authentication flow continues...
-}
-```
-
-These changes ensure that:
-1. Both modules consistently recognize and validate the Bearer token
-2. They set up proper user identity for mobile requests
-3. They avoid redirecting mobile requests with valid tokens to Auth0 login
-
-This should prevent the mobile flow from getting redirected to the Auth0 login page when calling the Certificate endpoint. The key is making sure that every part of your authentication pipeline properly recognizes and handles Bearer tokens.
-
-=============
-# Authentication Flow Documentation for Auth0 Integration
-
-## Overview
-
-This document explains the authentication flow in the EHealth application after integrating Auth0. The system handles both web and mobile authentication paths while maintaining compatibility with legacy FormsAuthentication.
-
-## Key Components
-
-1. **Auth0SessionModule** - First-line authentication validation
-2. **LogoutCookieModule** - Manages logout operations consistently
-3. **UserSwitchDetectionModule** - Detects user changes across tabs
-4. **BMSSessionModule** - Manages user identity and session activity
-5. **FormsAuthentication** - Creates and manages auth tickets
-6. **AccountController** - Handles login/logout actions
-
-## Authentication Flow
-
-### Web Authentication Flow
-
-1. **Initial Request**:
-   - User navigates to application
-   - Auth0SessionModule checks for FormsAuthentication cookie
-   - If no cookie exists, redirects to /Account/Index (login page)
-
-2. **Login Process**:
-   - User clicks "Login" button on /Account/Index
-   - AccountController.Login redirects to Auth0 login page
-   - User enters credentials on Auth0 page
-   - Auth0 redirects back to /Account/UserInfo with tokens
-   - UserInfo method:
-     - Verifies Auth0 token
-     - Looks up user in database using email
-     - Checks for account status (locked, inactive, etc.)
-     - Creates FormsAuthentication ticket with user roles and profile
-     - Redirects to appropriate homepage
-
-3. **Subsequent Requests**:
-   - Auth0SessionModule validates FormsAuth cookie
-   - Checks for session timestamp cookie to detect inconsistencies
-   - BMSSessionModule sets up proper user identity
-   - Updates user activity timestamp
-
-4. **Timeout Handling**:
-   - When FormsAuth cookie expires (30 min default)
-   - Auth0SessionModule detects expiration
-   - Redirects to /Account/Index
-   - Avoids direct Auth0 redirects for consistent experience
-
-5. **Tab Synchronization**:
-   - UserSwitchDetectionModule tracks last known user
-   - When user changes (login in another tab), forces page refresh
-   - Ensures consistent user experience across browser tabs
-
-### Mobile Authentication Flow
-
-1. **Initial Login**:
-   - Mobile app redirects to Auth0 login
-   - After successful login, Auth0 redirects to mobile callback URL
-   - Mobile app calls /Account/UserInfo with Bearer token in Authorization header
-
-2. **API Authentication**:
-   - Mobile requests include Bearer token in Authorization header
-   - Auth0SessionModule and BMSSessionModule detect token
-   - Validate token and retrieve user information
-   - Set up user context without requiring FormsAuth cookie
-   - Enhanced token handling ensures consistent authentication
-
-3. **Response Handling**:
-   - UserInfo returns JSON with user details for mobile
-   - Subsequent API calls maintain Bearer token authentication
-
-## Logout Process
-
-1. **Web Logout**:
-   - User clicks Logout
-   - AccountController.Logout clears all cookies and session
-   - Signs out of both FormsAuth and Auth0
-   - Redirects to login page
-
-2. **Plan Admin Logout (VB Project)**:
-   - Called from VB component
-   - LogoutCookieModule intercepts any logout URL (/Account/LogOff or /Account/Logout)
-   - Ensures consistent cookie and session clearing
-   - Handles Auth0 logout even from legacy code
-
-## Key Authentication Mechanisms
-
-### Session Timestamp Cookie
-
-Added to detect authentication changes across tabs. When the timestamp cookie exists but auth cookie doesn't, we know authentication state has changed.
-
-```
-SessionTimestamp = DateTime.UtcNow.Ticks.ToString()
-```
-
-### FormsAuthentication Ticket
-
-Contains all user information needed for the application:
-- User ID
-- Roles
-- Session GUID
-- Client IP
-- User Agent
-
-Format:
-```
-userRoles + "|" + userProfile + "|" + TrueClientIP
-```
-
-## Edge Cases Handling
-
-1. **Multiple Tabs, Different Users**:
-   - UserSwitchDetectionModule compares cookie user with session user
-   - Forces page refresh when they don't match
-   - Ensures consistent experience
-
-2. **Timeout Redirection**:
-   - All modules redirect to /Account/Index not directly to Auth0
-   - Provides consistent timeout experience
-
-3. **Authentication State Mismatch**:
-   - If SessionTimestamp exists but auth cookie doesn't, cleans up state
-   - Prevents stale authentication headers
-
-4. **Redirect Loop Prevention**:
-   - Tracks redirect count to detect infinite loops
-   - Forces state cleanup if too many redirects occur
-
-5. **Cookie Tampering**:
-   - Validates integrity of FormsAuth ticket
-   - Redirects to login if validation fails
-
-6. **Mobile Token Handling**:
-   - Consistent token validation across all modules
-   - Proper user identity setup without FormsAuth cookie
-
-## Sequence Diagram (High-Level)
-
-```
-Browser/Mobile -> Application: Request
-Application -> Auth0SessionModule: Validate Auth
-Auth0SessionModule -> Auth0: Redirect if unauthenticated
-Auth0 -> Application: Callback with tokens
-Application -> AccountController: Process authentication
-AccountController -> FormsAuthentication: Create auth ticket
-Application -> BMSSessionModule: Setup user identity
-Application -> User: Authenticated response
-```
-
-## HTTP Module Execution Order
-
-1. Auth0SessionModule
-2. LogoutCookieModule
-3. UserSwitchDetectionModule
-4. BMSSessionModule
-
-This order ensures proper authentication validation, logout handling, user change detection, and session management.
-
-=======================
-# Code Explanation for Auth0 Integration Components
-
-## 1. FormsAuthentication Class Modifications
-
-```csharp
-public class FormsAuthentication : IFormsAuthentication
-{
-    // Constructor and dependencies remain the same
-    
-    public void SignIn(string userId, bool createPersistentCookie)
-    {
-        // 1. Get user information and roles from database
-        var userProfileRoles = _bmsDbUow.Users.GetProfileRoles(userId);
-        var userRoles = string.Join(";", userProfileRoles.WebRoles);
-        
-        // 2. Format user profile data for the ticket
-        var userProfile = string.Format(";{0};{1};{2};;{3};{4};{5}",
-            userProfileRoles.SessionGuid,
-            userProfileRoles.UserId,
-            userProfileRoles.LastWebCallDateTime.HasValue ? userProfileRoles.LastWebCallDateTime.Value.ToString("yyyyMMddHHmmss") : string.Empty,
-            userProfileRoles.ContactName,
-            request.UserHostAddress,
-            userAgentBase64);
-            
-        // 3. Create FormsAuthentication ticket with all user data
-        var ticket = new FormsAuthenticationTicket(
-            1, // Version
-            userProfileRoles.UserId, // Username
-            DateTime.Now, // Date ticket was issued
-            DateTime.Now.AddMinutes(_settings.AuthCookieExpirationInMinutes),  
-            createPersistentCookie,
-            userData);
-            
-        // 4. Add the encrypted ticket as a cookie
-        var authCookie = new HttpCookie(FormsAuth.FormsCookieName, ticketHash);
-        response.Cookies.Add(authCookie);
-        
-        // 5. Add session timestamp cookie to track authentication state
-        var sessionTimestampCookie = new HttpCookie("SessionTimestamp", DateTime.UtcNow.Ticks.ToString());
-        response.Cookies.Add(sessionTimestampCookie);
-        
-        // 6. Set up claims identity for OWIN compatibility
-        var claimsIdentity = new ClaimsIdentity("Auth0");
-        claimsIdentity.AddClaim(new Claim(ClaimTypes.Name, userId));
-        claimsIdentity.AddClaim(new Claim("BMSUserName", userId));
-        
-        // 7. Set current user for this request
-        var principal = new GenericPrincipal(claimsIdentity, userProfileRoles.WebRoles);
-        System.Threading.Thread.CurrentPrincipal = principal;
-        HttpContext.Current.User = principal;
-    }
-    
-    public void SignOut()
-    {
-        // 1. Clear all authentication cookies
-        ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Auth);
-        ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.TimeoutIndicator);
-        ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Context);
-        ExpireCookie("SessionTimestamp");
-        FormsAuth.SignOut();
-        
-        // 2. Clear session data
-        if (HttpContext.Current.Session != null)
-        {
-            HttpContext.Current.Session.Clear();
-            HttpContext.Current.Session.Abandon();
-        }
-        
-        // 3. Sign out of Auth0 via OWIN
-        var owinContext = HttpContext.Current.GetOwinContext();
-        if (owinContext != null)
-        {
-            owinContext.Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
-            owinContext.Authentication.SignOut("Auth0");
-        }
-    }
-}
-```
-
-**Key Changes:**
-- Added `SessionTimestamp` cookie to track authentication state across tabs
-- Ensured consistent cleanup of all cookies during sign out
-- Added OWIN sign out to ensure Auth0 session is properly cleared
-
-## 2. Auth0SessionModule Class
-
-```csharp
-public class Auth0SessionModule : IHttpModule
-{
-    public void Init(HttpApplication app)
-    {
-        // 1. Register for early auth check and post-session acquisition
-        app.AuthenticateRequest += OnAuthenticateRequest;
-        app.PostAcquireRequestState += OnPostAcquireRequestState;
-    }
-    
-    private void OnAuthenticateRequest(object sender, EventArgs e)
-    {
-        // 1. Early check - especially for login pages
-        // 2. Clear timestamp cookie if auth cookie is missing
-        // 3. Ensures login page shows unauthenticated state
-    }
-    
-    private void OnPostAcquireRequestState(object sender, EventArgs e)
-    {
-        // 1. Skip for specified routes
-        if (AuthenticationHelper.ShouldSkipRoute(request.Path.ToLowerInvariant()))
-            return;
-            
-        // 2. Handle mobile token requests
-        if (!string.IsNullOrEmpty(request.Headers["Authorization"]))
-            return;
-            
-        // 3. Check for FormsAuth cookie
-        var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
-        var timestampCookie = request.Cookies["SessionTimestamp"];
-        
-        // 4. No auth cookie = redirect to login
-        if (authCookie == null)
-        {
-            if (!AuthenticationHelper.ShouldSkipPages(request.Path.ToLowerInvariant()) &&
-                !app.Context.Request.Path.ToLowerInvariant().Contains("/account/login"))
+            catch (Exception ex)
             {
-                RedirectToAuth0(app.Context);
-                return;
-            }
-        }
-        
-        // 5. Detect inconsistent state (auth cookie but no timestamp)
-        if (authCookie != null && timestampCookie == null) {
-            ClearAuthenticationState(app.Context);
-            RedirectToAuth0(app.Context);
-            return;
-        }
-        
-        // 6. Check IP address changes
-        if (authCookieInfo.IsAuthenticated && TrueClientIP != authCookieInfo.TrueClientIP) {
-            // Clear cookies, session and return unauthorized
-            // ...
-            return;
-        }
-        
-        // 7. Check for expired FormsAuth ticket
-        if (!app.Context.Request.Path.ToLowerInvariant().Contains("/account/login")) {
-            var ticket = FormsAuthentication.Decrypt(authCookie.Value);
-            if (ticket.Expired) {
+                log.Error("Error in Auth0SessionModule", ex);
+                //Any error in cookie validation
                 ClearAuthenticationState(app.Context);
                 RedirectToAuth0(app.Context);
                 return;
             }
         }
-    }
-    
-    private void RedirectToAuth0(HttpContext context)
-    {
-        // Redirects to /Account/Index instead of Auth0 directly
-        // Ensures consistent timeout behavior
-        context.Response.Redirect("/Account/Index", false);
-    }
-    
-    private void ClearAuthenticationState(HttpContext context)
-    {
-        // Thoroughly clears all auth cookies and session
-        // Signs out of Auth0 via OWIN
-    }
-}
-```
 
-**Key Features:**
-- Handles both web and mobile authentication flows
-- Checks for inconsistent auth state (missing cookies)
-- Handles IP address changes (security feature)
-- Consistent redirect to login page
-- Complete state cleanup on authentication failures
-
-## 3. BMSSessionModule Class
-
-```csharp
-public class BmsSessionModule : IHttpModule
-{
-    public void Init(HttpApplication context)
-    {
-        context.PostAuthorizeRequest += Application_PostAuthorizeRequest;
-    }
-    
-    private void Application_PostAuthorizeRequest(object source, EventArgs e)
-    {
-        // 1. Special handling for mobile token
-        if (!string.IsNullOrEmpty(app.Context.Request.Headers["Authorization"]))
-            return;
-        
-        // 2. Skip specific routes
-        if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path))
-            return;
-        
-        // 3. For authenticated users, verify session state
-        if (app.Context.User != null && app.Context.User.Identity.IsAuthenticated)
+        public void Dispose()
         {
-            // 4. Check callback URL
-            if (app.Context.Request.Path.ToLowerInvariant().Contains("account/userinfo"))
-                return;
-            
-            // 5. Verify auth cookie exists
-            if (authCookie == null)
+        }
+
+        private void RedirectToAuth0(HttpContext context)
+        {
+            ClearCertificateCookie(context);
+            ClearAuthenticationState(context);
+
+            // Always redirect to /Account/Index, not directly to Auth0
+            // This ensures consistent timeout behavior
+            context.Response.Redirect("/Account/Index", false);
+            context.ApplicationInstance.CompleteRequest();
+        }
+
+        private void ClearCertificateCookie(HttpContext context)
+        {
+            //Clear Certificate cookie first
+            var pmCertIdCookie = context.Request.Cookies[EQ.EquitableHealth.Web.Constants.CookieNames.PmCertId];
+            if (pmCertIdCookie != null)
             {
-                TriggerReauthentication(app.Context);
-                return;
-            }
-            
-            // 6. Verify session timestamp cookie exists
-            if (timestampCookie == null) {
-                TriggerReauthentication(app.Context);
-                return;
-            }
-            
-            // 7. Validate ticket and update last activity
-            try {
-                var authCookieInfo = new AuthCookieInfo(authCookie);
-                var userId = GetEffectiveUserId(app.Context, authCookieInfo);
-                
-                // Validate expiration
-                var ticket = FormsAuthentication.Decrypt(authCookie.Value);
-                if (ticket.Expired) {
-                    TriggerReauthentication(app.Context);
-                    return;
-                }
-                
-                // Update last activity
-                bmsDbUow.Users.UpdateLastActivityDate(userId, authCookieInfo.SessionGuid);
-                
-                // Set up identity
-                SetupUserIdentity(app.Context, userId, authCookieInfo.Roles);
-            }
-            catch {
-                TriggerReauthentication(app.Context);
+                pmCertIdCookie = new HttpCookie(EQ.EquitableHealth.Web.Constants.CookieNames.PmCertId, null);
+                pmCertIdCookie.Expire();
+                context.Response.Cookies.Add(pmCertIdCookie);
             }
         }
-    }
-    
-    private void SetupUserIdentity(HttpContext context, string userId, string[] roles)
-    {
-        // Creates user principal with proper identity and roles
-        var identity = new GenericIdentity(userId, CookieAuthenticationDefaults.AuthenticationType);
-        context.User = new GenericPrincipal(identity, roles);
-    }
-    
-    private string GetEffectiveUserId(HttpContext context, AuthCookieInfo cookieInfo)
-    {
-        // Gets user ID from claims or falls back to cookie
-        var claimsPrincipal = context.User as ClaimsPrincipal;
-        if (claimsPrincipal != null)
+
+        private void ClearAuthenticationState(HttpContext context)
         {
-            var userIdClaim = claimsPrincipal.FindFirst("BMSUserName");
-            if (userIdClaim != null)
-                return userIdClaim.Value;
-        }
-        return cookieInfo.UserName;
-    }
-    
-    private void TriggerReauthentication(HttpContext context)
-    {
-        // Redirects to login page
-        context.Response.Redirect("/Account/Index", false);
-    }
-}
-```
+            //Clear all authentication cookies
+            var authCookie = new HttpCookie(FormsAuthentication.FormsCookieName)
+            {
+                Expires = DateTime.Now.AddDays(-1),
+                Domain = FormsAuthentication.CookieDomain
+            };
+            context.Response.Cookies.Add(authCookie);
 
-**Key Features:**
-- Manages user identity after authentication
-- Updates last activity timestamp
-- Double-checks authentication validity 
-- Consistent re-authentication behavior
+            var timestampCookie = new HttpCookie("SessionTimestamp")
+            {
+                Expires = DateTime.Now.AddDays(-1),
+                Domain = FormsAuthentication.CookieDomain
+            };
+            context.Response.Cookies.Add(timestampCookie);
 
-## 4. LogoutCookieModule Class
-
-```csharp
-public class LogoutCookieModule : IHttpModule
-{
-    public void Init(HttpApplication context)
-    {
-        context.EndRequest += OnEndRequest;
-    }
-    
-    private void OnEndRequest(object sender, EventArgs e)
-    {
-        // 1. Check if any logout URL is being accessed
-        if (request.Path.ToLowerInvariant().Contains("/account/logoff") ||
-            request.Path.ToLowerInvariant().Contains("/account/logout"))
-        {
-            // 2. Clear all authentication cookies
-            ClearAllAuthCookies(context);
-            
-            // 3. Clear session
+            //Clear session
             if (context.Session != null)
             {
                 context.Session.Clear();
                 context.Session.Abandon();
             }
-            
-            // 4. Sign out of Auth0
+
+            //Sign out of Auth0
             try
             {
                 var owinContext = context.GetOwinContext();
@@ -844,190 +2114,975 @@ public class LogoutCookieModule : IHttpModule
             }
         }
     }
-    
-    private void ClearAllAuthCookies(HttpContext context)
-    {
-        // Clears all authentication-related cookies
-        // Includes FormsAuth, SessionTimestamp, and ASP.NET cookies
-    }
 }
-```
 
-**Key Features:**
-- Intercepts any logout URL (both /Logout and /LogOff)
-- Ensures consistent cookie and session cleanup
-- Handles Auth0 signout even from legacy VB code
-- Prevents partial logout issues
+=====
+using EQ.EquitableHealth.Data.Bms.Data;
+using EQ.EquitableHealth.Globalization;
+using EQ.EquitableHealth.Logging;
+using EQ.EquitableHealth.Web;
+using EQ.Health.Web.Helpers;
+using log4net;
+using Microsoft.Owin.Security;
+using Microsoft.Owin.Security.Cookies;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using Org.BouncyCastle.Asn1.Ocsp;
+using System;
+using System.Configuration;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Net.Http;
+using System.Security.Claims;
+using System.Security.Principal;
+using System.Text;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.Security;
 
-## 5. UserSwitchDetectionModule Class
-
-```csharp
-public class UserSwitchDetectionModule : IHttpModule
+namespace Equitable.EquitableHealth.Web
 {
-    public void Init(HttpApplication context)
+    public class BmsSessionModule : IHttpModule
     {
-        context.PreRequestHandlerExecute += OnPreRequestHandlerExecute;
-    }
-    
-    private void OnPreRequestHandlerExecute(object sender, EventArgs e)
-    {
-        // 1. Skip for API calls, static resources, etc.
-        if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path.ToLowerInvariant()))
-            return;
-            
-        // 2. Skip for unauthenticated requests
-        if (app.Context.User == null || !app.Context.User.Identity.IsAuthenticated)
-            return;
-            
-        // 3. Get current user ID from auth cookie
-        var authCookie = request.Cookies[FormsAuthentication.FormsCookieName];
-        if (authCookie == null) return;
-        
-        // 4. Compare current cookie user with session user
-        var authCookieInfo = new AuthCookieInfo(authCookie);
-        var currentCookieUser = authCookieInfo.UserName;
-        var lastKnownUser = app.Context.Session["LastKnownUserID"] as string;
-        
-        // 5. First request - store user ID
-        if (string.IsNullOrEmpty(lastKnownUser))
+        private static readonly ILog log = LogManager.GetLogger(typeof(BmsSessionModule));
+
+        public void Init(HttpApplication context)
         {
-            app.Context.Session["LastKnownUserID"] = currentCookieUser;
-            return;
+            context.PostAuthorizeRequest += Application_PostAuthorizeRequest;
         }
-        
-        // 6. If user changed, force page refresh
-        if (lastKnownUser != currentCookieUser)
+
+        private void Application_PostAuthorizeRequest(object source, EventArgs e)
         {
-            // Update session with new user
-            app.Context.Session["LastKnownUserID"] = currentCookieUser;
-            
-            // For HTML requests, redirect to force reload
-            if (!request.IsAjaxRequest())
+            const string legacyThrottleDateFormat = "MM/dd/yyyy HH:mm:ss";
+            var app = source as HttpApplication;
+            if (app == null) return;
+
+            //Check for Mobile token
+            if (!string.IsNullOrEmpty(app.Context.Request.Headers["Authorization"]))
             {
-                string currentUrl = request.Url.PathAndQuery;
-                currentUrl += separator + "userChanged=" + DateTime.Now.Ticks;
-                response.Redirect(currentUrl, false);
-                app.CompleteRequest();
+                log.Info("BmsSessionModule" + "Authorization Success");
+                return;
             }
-            else
+
+            var authCookie = app.Context.Request.Cookies[FormsAuthentication.FormsCookieName];
+            var timestampCookie = app.Context.Request.Cookies["SessionTimestamp"];
+
+            //Skip routes when path of the url changes to path mentioned in the ShouldSkipRoute function.
+            if (AuthenticationHelper.ShouldSkipRoute(app.Context.Request.Path))
             {
-                // For AJAX requests, add a header
-                response.Headers.Add("X-User-Changed", "true");
+                if (authCookie == null) return;
+
+                var authCookieInfo = new AuthCookieInfo(authCookie);
+                if (!authCookieInfo.IsAuthenticated) return;
+
+                SetupUserIdentity(app.Context, authCookieInfo.UserName, authCookieInfo.Roles);
+                return;
+            }
+
+            //Regular authentication flow
+            if (app.Context.User != null && app.Context.User.Identity.IsAuthenticated)
+            {
+                //If on callback URL, let it proceed to create FormsAuth ticket
+                if (app.Context.Request.Path.ToLowerInvariant().Contains("account/userinfo"))
+                {
+                    return;
+                }
+
+                //For other URLs, validate complete authentication
+                if (authCookie == null)
+                {
+                    TriggerReauthentication(app.Context);
+                    return;
+                }
+
+                // Verify session timestamp cookie exists - if not, force re-auth
+                // This handles multi-tab scenarios when logging in as different users
+                if (timestampCookie == null && !AuthenticationHelper.ShouldSkipPages(app.Context.Request.Path.ToLowerInvariant()))
+                {
+                    TriggerReauthentication(app.Context);
+                    return;
+                }
+
+                DateTime lastUpdate;
+                if (app.Context.Request.Cookies[EQ.EquitableHealth.Web.Constants.CookieNames.LegacyRefreshThrottle] == null)
+                {
+                    lastUpdate = DateTime.MinValue;
+                }
+                else
+                {
+                    try
+                    {
+                        lastUpdate = DateTime.ParseExact(app.Context.Request.Cookies[EQ.EquitableHealth.Web.Constants.CookieNames.LegacyRefreshThrottle].Value, legacyThrottleDateFormat, Culture.Invariant);
+                    }
+                    catch  // unable to parse cookie value
+                    {
+                        lastUpdate = DateTime.MinValue;
+                    }
+                }
+
+                // Check auth cookie validity
+                try
+                {
+                    var authCookieInfo = new AuthCookieInfo(authCookie);
+                    var userId = GetEffectiveUserId(app.Context, authCookieInfo);
+
+                    // Validate FormsAuth ticket
+                    var ticket = FormsAuthentication.Decrypt(authCookie.Value);
+                    if (ticket.Expired)
+                    {
+                        TriggerReauthentication(app.Context);
+                        return;
+                    }
+
+                    // Keep the last activity date updated
+                    if (DateTime.Now > lastUpdate.AddSeconds(15))
+                    {
+                        app.Context.Response.Cookies.Add(new HttpCookie(EQ.EquitableHealth.Web.Constants.CookieNames.LegacyRefreshThrottle, DateTime.Now.ToString(legacyThrottleDateFormat, Culture.Invariant)));
+
+                        var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
+                        bmsDbUow.Users.UpdateLastActivityDate(userId, authCookieInfo.SessionGuid);  // this call will update last request datetime in database
+                    }
+
+                    //Set up identity with proper userId
+                    SetupUserIdentity(app.Context, userId, authCookieInfo.Roles);
+                }
+                catch (Exception ex)
+                {
+                    log.Error("Error validating authentication", ex);
+                    TriggerReauthentication(app.Context);
+                    return;
+                }
             }
         }
-    }
-}
-```
 
-**Key Features:**
-- Detects when user identity changes across tabs
-- Stores last known user in session state
-- Forces page reload when user changes
-- Handles both regular and AJAX requests differently
-- Prevents stale UI showing wrong user
-
-## 6. AccountController Updates
-
-```csharp
-public ActionResult Index(string returnUrl)
-{
-    // 1. Clear any stale authentication state
-    if (User.Identity.IsAuthenticated)
-    {
-        // 2. User is authenticated but still on login page - inconsistent state
-        _formsAuthentication.SignOut();
-        
-        // 3. Clear all authentication cookies
-        foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
+        public void Dispose()
         {
-            if (cookieName.StartsWith(".AspNet") || 
-                cookieName == FormsAuthentication.FormsCookieName || 
-                cookieName == "SessionTimestamp")
-            {
-                var cookie = new HttpCookie(cookieName) { Expires = DateTime.Now.AddDays(-1) };
-                HttpContext.Response.Cookies.Add(cookie);
-            }
         }
-        
-        // 4. Clear session and OWIN authentication
-        HttpContext.Session.Clear();
-        HttpContext.Session.Abandon();
-        HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
-        HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
-    }
-    
-    // 5. Show login view
-    return View("~/Views/Account/Login.cshtml");
-}
 
-[AllowAnonymous]
-public ActionResult Login(string returnUrl)
+        private void SetupUserIdentity(HttpContext context, string userId, string[] roles)
+        {
+            var identity = new GenericIdentity(userId, CookieAuthenticationDefaults.AuthenticationType);
+            context.User = new GenericPrincipal(identity, roles);
+        }
+
+        private string GetEffectiveUserId(HttpContext context, AuthCookieInfo cookieInfo)
+        {
+            //First try to get userId from claims
+            var claimsPrincipal = context.User as ClaimsPrincipal;
+            if (claimsPrincipal != null)
+            {
+                var userIdClaim = claimsPrincipal.FindFirst("BMSUserName");
+                if (userIdClaim != null)
+                {
+                    return userIdClaim.Value;
+                }
+
+                //Fallback to cookie
+                return cookieInfo.UserName;
+            }
+            //Fallback to cookie
+            return cookieInfo.UserName;
+        }
+
+        private void TriggerReauthentication(HttpContext context)
+        {
+            // Always redirect to /Account/Index for consistency
+            context.Response.Redirect("/Account/Index", false);
+            context.ApplicationInstance.CompleteRequest();
+        }
+    }
+}
+=====
+using Microsoft.Owin;
+using Microsoft.Owin.Host.SystemWeb;
+using Microsoft.Owin.Security.Cookies;
+using Microsoft.Owin.Security;
+using Owin;
+using System;
+using System.Threading.Tasks;
+using System.Configuration;
+using Microsoft.IdentityModel.Protocols.OpenIdConnect;
+using Microsoft.Owin.Security.OpenIdConnect;
+using Microsoft.IdentityModel.Tokens;
+using System.Security.Claims;
+using EQ.EquitableHealth.Data.Bms.Data;
+using System.Web.Mvc;
+using System.Web.Security;
+using EQ.EquitableHealth.Web;
+using Microsoft.IdentityModel.Logging;
+
+[assembly: OwinStartup(typeof(Equitable.EquitableHealth.Web.Startup))]
+
+namespace Equitable.EquitableHealth.Web
 {
-    // 1. Clear any stale session timestamp cookie
-    var timestampCookie = Request.Cookies["SessionTimestamp"];
-    if (timestampCookie != null)
+    public class Startup
     {
-        var expiredCookie = new HttpCookie("SessionTimestamp") { Expires = DateTime.Now.AddDays(-1) };
-        Response.Cookies.Add(expiredCookie);
-    }
-    
-    // 2. Challenge Auth0 authentication
-    HttpContext.GetOwinContext().Authentication.Challenge(new AuthenticationProperties
-    {
-        RedirectUri = returnUrl ?? Url.Action("UserInfo", "Account"),
-        Dictionary = { { "prompt", "login" } } // Force Re-authentication
-    },
-    "Auth0");
+        public void Configuration(IAppBuilder app)
+        {
+            // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=316888
+            // Configure Auth0 parameters
+            string auth0Domain = ConfigurationManager.AppSettings["Auth0:Domain"];
+            string auth0ClientId = ConfigurationManager.AppSettings["Auth0:ClientId"];
+            string auth0MobileClientId = ConfigurationManager.AppSettings["Auth0:MobileClientId"];
+            string auth0RedirectUri = ConfigurationManager.AppSettings["Auth0:RedirectUri"];
+            string auth0PostLogoutRedirectUri = ConfigurationManager.AppSettings["Auth0:PostLogoutRedirectUri"];
+            string auth0ClientSecret = ConfigurationManager.AppSettings["Auth0:ClientSecret"];
+            // Set Cookies as default authentication type
+            app.SetDefaultSignInAsAuthenticationType(CookieAuthenticationDefaults.AuthenticationType);
+            app.UseCookieAuthentication(new CookieAuthenticationOptions
+            {
+                AuthenticationType = CookieAuthenticationDefaults.AuthenticationType,
+                LoginPath = new PathString("/Account/Index"),
+                CookieSameSite = SameSiteMode.None,
+                CookieManager = new SystemWebCookieManager(),
+                Provider = new CookieAuthenticationProvider
+                {
+                    //Validate cookie on every request
+                    OnValidateIdentity = context =>
+                    {
+                        var authCookie = context.OwinContext.Request.Cookies[FormsAuthentication.FormsCookieName];
 
-    return new HttpUnauthorizedResult();
+                        if (!string.IsNullOrEmpty(authCookie))
+                        {
+                            try
+                            {
+                                var cookieInfo = new AuthCookieInfo(new System.Web.HttpCookie(FormsAuthentication.FormsCookieName, authCookie));
+                                if (!cookieInfo.IsAuthenticated)
+                                {
+                                    context.RejectIdentity();
+                                }
+                            }
+                            catch
+                            {
+                                context.RejectIdentity();
+                            }
+                        }
+                        return Task.FromResult(0);
+                    }
+                }
+            });
+
+            //Configure Auth0 authentication
+            app.UseOpenIdConnectAuthentication(new OpenIdConnectAuthenticationOptions
+            {
+                AuthenticationType = "Auth0",
+                SignInAsAuthenticationType = CookieAuthenticationDefaults.AuthenticationType,
+                Authority = $"https://{auth0Domain}",
+                ClientId = auth0ClientId,
+                RedirectUri = auth0RedirectUri,
+                PostLogoutRedirectUri = auth0PostLogoutRedirectUri,
+                ResponseType = OpenIdConnectResponseType.CodeIdToken,
+                Scope = "openid profile email",
+                TokenValidationParameters = new TokenValidationParameters
+                {
+                    NameClaimType = "name",
+                    ValidateIssuer = true,
+                    ValidIssuer = $"https://{auth0Domain}",
+                    ValidateAudience = true,
+                    ValidAudiences = new[]
+                    {
+                         auth0ClientId,
+                         auth0MobileClientId
+                    }
+                },
+                CookieManager = new SystemWebCookieManager(),
+                Notifications = new OpenIdConnectAuthenticationNotifications
+                {
+                    SecurityTokenValidated = notification =>
+                    {
+                        var _bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
+                        var identity = notification.AuthenticationTicket.Identity;
+                        var email = identity.FindFirst(ClaimTypes.Email)?.Value;
+                        string userId = _bmsDbUow.Users.GetUserIdFromEmailAddress(email);
+
+                        //Create new identity with UserId as primary name
+                        var newIdentity = new ClaimsIdentity(identity.AuthenticationType);
+
+                        //Copy existing claims except name
+                        foreach (var claim in identity.Claims)
+                        {
+                            if (claim.Type!= ClaimTypes.Name)
+                            {
+                                newIdentity.AddClaim(claim);
+                            }
+                        }
+
+                        newIdentity.AddClaim(new Claim(ClaimTypes.Name, userId));
+                        newIdentity.AddClaim(new Claim("BMSUserName", userId));
+
+                        //Create new authenticated ticket with updated identiy
+                        notification.AuthenticationTicket = new AuthenticationTicket(newIdentity, notification.AuthenticationTicket.Properties);
+
+                        return Task.FromResult(0);
+                    },
+                    RedirectToIdentityProvider = notification =>
+                    {
+                        //Preserve prompt=login parameter when specified
+                        if (notification.ProtocolMessage.RequestType == OpenIdConnectRequestType.Authentication)
+                        {
+                            //Check if prompt parameter exists in properties
+                            if (notification.OwinContext.Authentication.AuthenticationResponseChallenge?.Properties.Dictionary != null &&
+                             notification.OwinContext.Authentication.AuthenticationResponseChallenge.Properties.Dictionary.ContainsKey("prompt"))
+                            {
+                                notification.ProtocolMessage.SetParameter("prompt",
+                                    notification.OwinContext.Authentication.AuthenticationResponseChallenge.Properties.Dictionary["prompt"]);
+                            }
+                        }
+
+                        if (notification.ProtocolMessage.RequestType == OpenIdConnectRequestType.Logout)
+                        {
+                            var logoutUri = $"https://{auth0Domain}/v2/logout?client_id={auth0ClientId}";
+
+                            var postLogoutUri = notification.ProtocolMessage.PostLogoutRedirectUri;
+                            if (!string.IsNullOrEmpty(postLogoutUri))
+                            {
+                                if (postLogoutUri.StartsWith("/"))
+                                {
+                                    // transform to absolute
+                                    var request = notification.Request;
+                                    postLogoutUri = request.Scheme + "://" + request.Host + request.PathBase + postLogoutUri;
+                                }
+                                logoutUri += $"&returnTo={Uri.EscapeDataString(postLogoutUri)}";
+                            }
+
+                            notification.Response.Redirect(logoutUri);
+                            notification.HandleResponse();
+                        }
+                        return Task.FromResult(0);
+                    },
+                    AuthenticationFailed = context =>
+                    {
+                        if (context.Exception is TaskCanceledException)
+                        {
+                            context.HandleResponse();
+                            context.Response.Redirect("/Account/index");
+                        }
+                        return Task.FromResult(0);
+                    }
+                }
+            });
+        }
+    }
 }
 
-[Authorize]
-public void Logout()
+=====
+@using Equitable.EquitableHealth.Web.HtmlParsing;
+@using Equitable.EquitableHealth.Web.UmbracoAddons;
+@inherits Umbraco.Web.Mvc.UmbracoTemplatePage
+@{
+    Layout = null;
+
+    if (!UserContext.IsViewingInPreview && !CurrentPage.AllowAnonymousUsers)
+    {
+        if (!UserContext.EnsureUserIsLoggedIn()) { return; }
+    }
+
+    var helpId = CurrentPage.HelpID as string;
+
+    var html = WebRequester.GetShell();
+
+    var parser = new HtmlParser();
+    parser.LoadHtml(html);
+    parser.SetTitle(umbraco.library.GetDictionaryItem("EquitableGroupBenefitsTitle"));
+    parser.AppendStyleSheetToHead("/cms/css/app.css");
+    parser.AppendStyleSheetToHead("/cms/css/healthconnector.css");
+    parser.AppendStyleSheetToHead("/cms/css/editor-styles.css");
+    parser.AppendStyleSheetToHead("/cms/css/unslider.css");
+    parser.AppendStyleSheetToHead("/cms/css/unslider-dots.css");
+
+    var roleNode = CurrentPage.AncestorOrSelf(2);
+    var renderOld = false;
+    var hasAccess = true;
+
+    string docType = roleNode.DocumentTypeAlias;
+    switch (docType)
+    {
+        case "User":
+            renderOld = true;
+            break;
+        case "PlanAdvisor":
+            renderOld = true;
+            hasAccess = UserContext.Roles.Contains("PlanAdvisor");
+            break;
+        case "PlanAdmin":
+            renderOld = true;
+            hasAccess = UserContext.Roles.Contains("PlanAdvisor") || UserContext.Roles.Contains("PlanAdmin");
+            break;
+        case "PlanMember":
+            renderOld = !UserContext.Roles.Contains("PlanMember");
+            break;
+    }
+
+    if (!hasAccess && !UserContext.IsViewingInPreview)
+    {
+        // If user doesn't have access to this role then take them home
+        Response.Redirect("/");
+        return;
+    }
+
+    if (renderOld)
+    {
+        parser.RemoveElementById("eq-brand-bar");
+        parser.RemoveElement("//header");
+        parser.RemoveElement("//footer");
+
+        if (!UserContext.IsViewingInPreview)
+        {
+            // Leave language toggle when previewing so user can check different languages
+            parser.RemoveElement("//*[contains(@class,'eq-lang-toggle')]");
+        }
+
+
+        parser.AppendScriptToBody("/v1/Scripts/Frame.js?v=5.4.6.0");
+        parser.AppendHtmlToBody(@"<script>
+                                    function resizeCmsContent() {
+                                        resizeForm('#eq-shell-content');
+                                    }
+                                    $(function () {
+                                        resizeCmsContent();
+                                    });
+                                </script>");
+    }
+
+    var split = parser.SplitByElementId("eq-shell-content");
+}
+
+@Html.Raw(split.Top)
+
+@if (!string.IsNullOrEmpty(helpId))
 {
-    // 1. Sign out of FormsAuthentication
-    _formsAuthentication.SignOut();
-
-    // 2. Clear all cookies
-    foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
-    {
-        HttpCookie cookie = new HttpCookie(cookieName) { Expires = DateTime.Now.AddDays(-1) };
-        HttpContext.Response.Cookies.Add(cookie);
-    }
-    
-    // 3. Clear session
-    HttpContext.Session.Clear();
-    HttpContext.Session.Abandon();
-
-    // 4. Sign out of Auth0
-    HttpContext.GetOwinContext().Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
-    HttpContext.GetOwinContext().Authentication.SignOut("Auth0");
-    
-    // 5. Redirect to login page
-    Response.Redirect("/Account/Index", false);
+    <input id="frmMain" type="hidden" helpid="@helpId" />
 }
-```
+							
+<div class="container-padding">
 
-**Key Features:**
-- Ensures login page always shows unauthenticated state
-- Clears stale cookies before Auth0 redirect
-- Complete cookie and session cleanup on logout
-- Consistent redirection to login page
+    @RenderBody()
 
-## Code Interrelationships
+</div>
 
-1. **Authentication Flow**:
-   - `AccountController` → Auth0 → `AccountController.UserInfo` → `FormsAuthentication.SignIn`
-   - Creates auth cookies and user identity
+@* Need this because Umbraco looks for </body> in the template but our template is dynamic *@
+@if (UserContext.IsViewingInPreview)
+{
+    <a id="umbracoPreviewBadge" style="position: absolute; top: 0; right: 0; border: 0; width: 149px; height: 149px; background: url('/cms/umbraco_client/preview/previewModeBadge.png') no-repeat;" href="/cms/umbraco/endPreview.aspx?redir=@HttpUtility.UrlEncode(HttpContext.Current.Request.Url.PathAndQuery)"><span style="display: none;">In Preview Mode - click to end</span></a>
+}
 
-2. **Request Validation**:
-   - `Auth0SessionModule` (first) - Basic cookie validation
-   - `BMSSessionModule` (later) - User identity setup
-   - `UserSwitchDetectionModule` (between them) - Detects user changes
+<script src="/cms/Scripts/unslider-min.js"></script>
+<script src="/cms/Scripts/main.js"></script>
 
-3. **Logout Flow**:
-   - Either `AccountController.Logout` or VB code LogOff 
-   - `LogoutCookieModule` intercepts both paths
-   - Ensures consistent cleanup regardless of entry point
+@Html.Raw(split.Bottom)
 
-Each component focuses on a specific aspect of authentication while working together to create a seamless experience for both web and mobile users.
+====
+using EQ.EquitableHealth.ArgumentValidation;
+using EQ.EquitableHealth.Data.Bms.Data;
+using EQ.EquitableHealth.Logging;
+using EQ.EquitableHealth.Web;
+using Equitable.EquitableHealth.Data.Bms.Configuration;
+using Microsoft.Owin.Security.Cookies;
+using System;
+using System.Security;
+using System.Security.Claims;
+using System.Security.Principal;
+using System.Text;
+using System.Web;
+using System.Web.Security;
+using FormsAuth = System.Web.Security.FormsAuthentication;
+
+namespace Equitable.EquitableHealth.Web.Security
+{
+    public class FormsAuthentication : IFormsAuthentication
+    {
+        private readonly IBmsDbUow _bmsDbUow;
+        private readonly ApplicationSettings _settings;
+        private readonly ILog<FormsAuthentication> _log;
+
+        public FormsAuthentication(IBmsDbUow bmsDbUow, ApplicationSettings settings, ILog<FormsAuthentication> log)
+        {
+            Check.Argument.IsNotNull(bmsDbUow, "bmsDbUow");
+            Check.Argument.IsNotNull(settings, "settings");
+
+            _bmsDbUow = bmsDbUow;
+            _settings = settings;
+            _log = log;
+        }
+
+        public void SignIn(string userId, bool createPersistentCookie)
+        {
+            Check.Argument.IsNotNullOrEmpty(userId, "userId");
+
+            var response = HttpContext.Current.Response;
+            var request = HttpContext.Current.Request;
+            // Creating and setting TrueClientIP variable to be set when available
+            string TrueClientIP = EQ.EquitableHealth.Web.Constants.CookieNames.TrueClientIP;
+
+            if (request.Headers["True-Client-IP"] != null)
+            {
+                TrueClientIP = request.Headers["True-Client-IP"];
+            }
+
+            _log.InfoFormat("TrueClientIP value is  {0}", TrueClientIP);
+
+            var userProfileRoles = _bmsDbUow.Users.GetProfileRoles(userId);
+            var userRoles = string.Join(";", userProfileRoles.WebRoles);
+
+            var userAgentBytes = Encoding.UTF8.GetBytes(request.UserAgent ?? "");
+            var userAgentBase64 = Convert.ToBase64String(userAgentBytes);
+
+            var userProfile = string.Format(";{0};{1};{2};;{3};{4};{5}",  // this format is to keep consistent with legacy app
+                userProfileRoles.SessionGuid,
+                userProfileRoles.UserId,
+                userProfileRoles.LastWebCallDateTime.HasValue ? userProfileRoles.LastWebCallDateTime.Value.ToString("yyyyMMddHHmmss") : string.Empty,
+                userProfileRoles.ContactName,
+                request.UserHostAddress,
+                userAgentBase64);
+
+            var userData = userRoles + "|" + userProfile + "|" + TrueClientIP;
+
+            _log.DebugFormat("Creating auth ticket for user {0} with data: {1}", userProfileRoles.UserId, userData);
+            var ticket = new FormsAuthenticationTicket(
+                1, // Version
+                userProfileRoles.UserId, // Username
+                DateTime.Now, // Date ticket was issued
+                DateTime.Now.AddMinutes(_settings.AuthCookieExpirationInMinutes),  // Ticket expiration date
+                createPersistentCookie,
+                userData);
+
+            string ticketHash = FormsAuth.Encrypt(ticket);
+
+            var authCookie = new HttpCookie(FormsAuth.FormsCookieName, ticketHash);
+            authCookie.Domain = FormsAuth.CookieDomain;
+            authCookie.Secure = FormsAuth.RequireSSL;
+            authCookie.SameSite = SameSiteMode.None;
+            authCookie.HttpOnly = true;
+
+            response.Cookies.Add(authCookie);
+
+            // Add session marker cookie with timestamp to detect new sessions
+            var sessionTimestampCookie = new HttpCookie("SessionTimestamp", DateTime.UtcNow.Ticks.ToString());
+            sessionTimestampCookie.Domain = FormsAuth.CookieDomain;
+            sessionTimestampCookie.Secure = FormsAuth.RequireSSL;
+            sessionTimestampCookie.SameSite = SameSiteMode.None;
+            sessionTimestampCookie.HttpOnly = true;
+            response.Cookies.Add(sessionTimestampCookie);
+
+            response.Cookies.Add(new HttpCookie(EQ.EquitableHealth.Web.Constants.CookieNames.TimeoutIndicator, "1"));
+            ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.LegacyTimeoutIndicator);  // Always remove this cookie on login so the legacy app won't detect a session timeout immediately following login
+
+            //Setup claims identity with consistent userId
+            var claimsIdentity = new ClaimsIdentity("Auth0");
+            claimsIdentity.AddClaim(new Claim(ClaimTypes.Name, userId));
+            claimsIdentity.AddClaim(new Claim("BMSUserName", userId));
+
+            //Create and set the principal
+            var principal = new GenericPrincipal(claimsIdentity, userProfileRoles.WebRoles);
+            System.Threading.Thread.CurrentPrincipal = principal;
+            HttpContext.Current.User = principal;
+        }
+
+        public void SignOut()
+        {
+            // Clear all authentication cookies
+            ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Auth);
+            ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.TimeoutIndicator);
+            ExpireCookie(EQ.EquitableHealth.Web.Constants.CookieNames.Context);
+            ExpireCookie("SessionTimestamp");
+            FormsAuth.SignOut();
+
+            // Clear session
+            if (HttpContext.Current.Session != null)
+            {
+                HttpContext.Current.Session.Clear();
+                HttpContext.Current.Session.Abandon();
+            }
+
+            // Ensure Auth0 is also signed out
+            var owinContext = HttpContext.Current.GetOwinContext();
+            if (owinContext != null)
+            {
+                owinContext.Authentication.SignOut(CookieAuthenticationDefaults.AuthenticationType);
+                owinContext.Authentication.SignOut("Auth0");
+            }
+
+        }
+
+        private void ExpireCookie(string name)
+        {
+            var cookie = new HttpCookie(name);
+            cookie.Expires = DateTime.Now.AddDays(-1);
+            cookie.Domain = FormsAuth.CookieDomain;
+            HttpContext.Current.Response.Cookies.Add(cookie);
+        }
+    }
+}
+
+
+===
+using EQ.EquitableHealth.Data.Bms.Data;
+using EQ.EquitableHealth.Globalization;
+using EQ.EquitableHealth.Utilities.SystemRoles;
+using EQ.Health.Web.Helpers;
+using System.Security.Claims;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.Routing;
+
+namespace Equitable.EquitableHealth.Web.Filters
+{
+    public class GroupInfoAttribute : FilterAttribute, IActionFilter
+    {
+        private readonly IBmsDbUow _uow;
+
+        public GroupInfoAttribute()
+        {
+            _uow = DependencyResolver.Current.GetService<IBmsDbUow>();
+        }
+
+        public void OnActionExecuted(ActionExecutedContext filterContext)
+        {
+            if (!filterContext.HttpContext.User.Identity.IsAuthenticated)
+            {
+                return;
+            }
+
+            // For now this only looks for Plan Member group info
+            // In the future this could be expanded for Admin/Advisor
+
+            var pmCertIdCookie = filterContext.RequestContext.HttpContext.Request.Cookies[EQ.EquitableHealth.Web.Constants.CookieNames.PmCertId];
+            if (pmCertIdCookie == null)
+            {
+                return;
+            }
+
+            int certificateId;
+            if (!int.TryParse(pmCertIdCookie.Value, out certificateId))
+            {
+                return;
+            }
+
+            var session = filterContext.RequestContext.HttpContext.Session;
+            if (session == null)
+            {
+                return;
+            }
+
+            var groupInfoSessionKey = Constants.SessionKeys.PmGroupInfo.FormatWith(certificateId);
+            var groupInfo = session[groupInfoSessionKey] as GroupInfo;
+
+            if (groupInfo == null)
+            {
+                var userId = GetUserId(filterContext.RequestContext.HttpContext);
+                var certificate = _uow.Certificates.GetCertificateDetail(
+                    userId,
+                    certificateId,
+                    WebRole.PlanMember);
+
+                groupInfo = new GroupInfo
+                {
+                    EmployerName = certificate.EmployerName,
+                    PolicyCode = certificate.PolicyCode,
+                    PolicyId = certificate.PolicyId,
+                    CertificateNumber = certificate.CertificateNumber
+                };
+
+                session[groupInfoSessionKey] = groupInfo;
+            }
+
+            filterContext.Controller.ViewBag.GroupInfo = groupInfo;
+        }
+
+        public void OnActionExecuting(ActionExecutingContext filterContext)
+        {
+        }
+
+        public class GroupInfo
+        {
+            public string EmployerName { get; set; }
+            public string PolicyCode { get; set; }
+            public string CertificateNumber { get; set; }
+            public string FirstName { get; set; }
+            public string LastName { get; set; }
+            public int PolicyId { get; set; }
+        }
+
+        private string GetUserId(HttpContextBase context)
+        {
+            // Try to get userId from claims first
+            var claimsIdentity = context?.User.Identity as ClaimsIdentity;
+            if (claimsIdentity != null)
+            {
+                var bmsUserNameClaim = claimsIdentity.FindFirst("BMSUserName");
+                if (bmsUserNameClaim != null)
+                {
+                    return bmsUserNameClaim.Value;
+                }
+            }
+            // Fallback to Identity.Name which should also be userId
+            return context.User?.Identity?.Name;
+        }
+    }
+}
+====
+@{
+    Layout = "";
+}
+<footer class="footer container">
+    <div class="row">
+        <div class="col-md-4"></div>
+
+        <div class="col-md-8">
+            <div class="eq-footer-nav">
+                <ul>
+                    <li>
+                        @if (User.Identity.IsAuthenticated && !HttpContext.Current.Request.Path.ToLowerInvariant().Contains("/account/index"))
+                        {
+                            if (ViewBag.GroupInfo != null && ViewBag.GroupInfo.PolicyId != null)
+                            {
+                                <a href="@Url.GetInTouch((int)ViewBag.GroupInfo.PolicyId)">@Html.GetString("lblGetInTouch")</a>
+                            }
+                            else
+                            {
+                                <a href="@Url.GetInTouch()">@Html.GetString("lblGetInTouch")</a>
+                            }
+                        }
+                        else
+                        {
+                            <a href="@(EQ.EquitableHealth.Globalization.Culture.IsFrench ? "http://www.equitable.ca/fr/communiquer-avec-nous.aspx" : "http://www.equitable.ca/en/get-in-touch.aspx")">
+                                @(Html.GetString("lblGetInTouch"))
+                            </a>
+                        }
+                    </li>
+                    <li><a href="/cms/common/privacy">@Html.GetString("lblPrivacy")</a></li>
+                    <li><a href="/cms/common/terms-of-use">@Html.GetString("lblTermsOfUse")</a></li>
+                    <li><a href="@(EQ.EquitableHealth.Globalization.Culture.IsFrench ? "http://www.equitable.ca/fr/" : "http://www.equitable.ca")">@Html.GetString("lblEquitableLink")</a></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</footer>
+
+@if (ViewBag.AppSettings != null && ViewBag.AppSettings.IncludeGoogleAnalytics)
+{
+    <script type="text/javascript">
+
+        var _gaq = _gaq || [];
+        _gaq.push(['_setAccount', 'UA-12986177-6']);
+        _gaq.push(['_trackPageview']);
+
+        $('.healthConnector').click(function () {
+            if (_gaq) _gaq.push(['_trackEvent', 'Group Benefits', "Link Clicked", "HealthConnector"]);
+        });
+
+        (function () {
+            var ga = document.createElement('script'); ga.type = 'text/javascript'; ga.async = true;
+            ga.src = ('https:' == document.location.protocol ? 'https://ssl' : 'http://www') + '.google-analytics.com/ga.js';
+            var s = document.getElementsByTagName('script')[0]; s.parentNode.insertBefore(ga, s);
+        })();
+    </script>
+     <!-- Google tag (gtag.js) -->
+     <script async src="https://www.googletagmanager.com/gtag/js?id=G-P4HB9NS5TS"></script>
+     <script>
+         window.dataLayer = window.dataLayer || [];
+         function gtag() { dataLayer.push(arguments); }
+         gtag('js', new Date());
+         gtag('config', 'G-P4HB9NS5TS');
+      </script>
+}
+=====
+using EQ.EquitableHealth.Web;
+using EQ.Health.Web.Helpers;
+using System.Web;
+using System.Web.Mvc;
+using System.Web.Security;
+
+namespace Equitable.EquitableHealth.Web.Filters
+{
+    public class AppAuthorize : AuthorizeAttribute
+    {
+        protected override bool AuthorizeCore(HttpContextBase httpContext)
+        {
+            // If it's a mobile request with Authorization header
+            var authHeader = httpContext.Request.Headers["Authorization"];
+            if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer"))
+            {
+                // Let mobile auth flow handle it (it will populate httpContext.User)
+                return true;
+            }
+
+            // Standard web authentication
+            return base.AuthorizeCore(httpContext) && httpContext.User?.Identity?.IsAuthenticated == true;
+        }
+    }
+}
+====
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  For more information on how to configure your ASP.NET application, please visit
+  http://go.microsoft.com/fwlink/?LinkId=169433
+  -->
+<configuration>
+	<configSections>
+		<section name="entityFramework_EquitableHealth" type="System.Data.Entity.Internal.ConfigFile.EntityFrameworkSection, EntityFramework, Version=5.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" requirePermission="false" />
+	</configSections>
+	<appSettings configSource="Settings.config" />
+	<connectionStrings configSource="Connections.config" />
+	<location path="." inheritInChildApplications="false">
+		<system.web>
+			<machineKey validationKey="818B77A6AFBF5E0B82B7FBE6F992E1733986DAEF81D1EB107B55D6F68EB6FEC6097349A9E37A407A6B5CF2FA1AB9327CA182A2C999A768C14B146036420203F9" decryptionKey="45798D54477D1D11BFC16733786AABB50E7FD5DDB3F8F46A" validation="SHA1" compatibilityMode="Framework20SP2" />
+			<httpRuntime targetFramework="4.8 " />
+			<compilation debug="true" targetFramework="4.8" />
+			<authentication mode="None">
+				<forms loginUrl="~/Account/Login" protection="All" requireSSL="true" name="BMSWebAuthCookie" path="/" slidingExpiration="true" timeout="30" />
+			</authentication>
+			<pages controlRenderingCompatibilityVersion="4.0">
+				<namespaces>
+					<add namespace="System.Web.Helpers" />
+					<add namespace="System.Web.Mvc" />
+					<add namespace="System.Web.Mvc.Ajax" />
+					<add namespace="System.Web.Mvc.Html" />
+					<add namespace="System.Web.Routing" />
+					<add namespace="System.Web.WebPages" />
+				</namespaces>
+			</pages>
+			<membership defaultProvider="BmsMembershipProvider">
+				<providers>
+					<clear />
+					<add name="BmsMembershipProvider" type="Equitable.EquitableHealth.Web.Security.BmsMembershipProvider" connectionStringName="BmsConnection" enablePasswordRetrieval="false" enablePasswordReset="true" requiresQuestionAndAnswer="false" requiresUniqueEmail="false" maxInvalidPasswordAttempts="5" minRequiredPasswordLength="6" minRequiredNonalphanumericCharacters="0" passwordAttemptWindow="10" applicationName="/" />
+				</providers>
+			</membership>
+			<httpModules>
+				<add name="SuppressFormsAuthRedirectModule" type="Equitable.EquitableHealth.Web.SuppressFormsAuthRedirectModule, Equitable.EquitableHealth.Web" />
+				<add name="Localization" type="Equitable.EquitableHealth.Web.LocalizationModule, Equitable.EquitableHealth.Web" />
+				<add name="Auth0SessionModule" type="Equitable.EquitableHealth.Web.Auth0SessionModule, Equitable.EquitableHealth.Web" />
+				<add name="LogoutCookieModule" type="Equitable.EquitableHealth.Web.LogoutCookieModule, Equitable.EquitableHealth.Web" />
+				<add name="BmsSession" type="Equitable.EquitableHealth.Web.BmsSessionModule, Equitable.EquitableHealth.Web" />
+				<add name="CustomErrors" type="Equitable.EquitableHealth.Web.ErrorModule, Equitable.EquitableHealth.Web" />
+			</httpModules>
+			<customErrors mode="Off" />
+			<!--<httpCookies sameSite="None" requireSSL="true" secure="true" />-->
+			<httpCookies sameSite="None" requireSSL="true" secure="true"  />
+		</system.web>
+	</location>
+	<location path="." inheritInChildApplications="false">
+		<system.webServer>
+			<validation validateIntegratedModeConfiguration="false" />
+			<modules>
+				<add name="SuppressFormsAuthRedirectModule" type="Equitable.EquitableHealth.Web.SuppressFormsAuthRedirectModule, Equitable.EquitableHealth.Web" preCondition="managedHandler" />
+				<add name="Localization" type="Equitable.EquitableHealth.Web.LocalizationModule, Equitable.EquitableHealth.Web" preCondition="managedHandler" />
+				<add name="Auth0SessionModule" type="Equitable.EquitableHealth.Web.Auth0SessionModule, Equitable.EquitableHealth.Web" preCondition="managedHandler" />
+				<add name="LogoutCookieModule" type="Equitable.EquitableHealth.Web.LogoutCookieModule, Equitable.EquitableHealth.Web" preCondition="managedHandler" />
+				<add name="BmsSession" type="Equitable.EquitableHealth.Web.BmsSessionModule, Equitable.EquitableHealth.Web" preCondition="managedHandler" />
+			</modules>
+			<handlers>
+				<remove name="ExtensionlessUrlHandler-ISAPI-4.0_32bit" />
+				<remove name="ExtensionlessUrlHandler-ISAPI-4.0_64bit" />
+				<remove name="ExtensionlessUrlHandler-Integrated-4.0" />
+				<add name="ExtensionlessUrlHandler-ISAPI-4.0_32bit" path="*." verb="GET,HEAD,POST,DEBUG,PUT,DELETE,PATCH,OPTIONS" modules="IsapiModule" scriptProcessor="%windir%\Microsoft.NET\Framework\v4.0.30319\aspnet_isapi.dll" preCondition="classicMode,runtimeVersionv4.0,bitness32" responseBufferLimit="0" />
+				<add name="ExtensionlessUrlHandler-ISAPI-4.0_64bit" path="*." verb="GET,HEAD,POST,DEBUG,PUT,DELETE,PATCH,OPTIONS" modules="IsapiModule" scriptProcessor="%windir%\Microsoft.NET\Framework64\v4.0.30319\aspnet_isapi.dll" preCondition="classicMode,runtimeVersionv4.0,bitness64" responseBufferLimit="0" />
+				<add name="ExtensionlessUrlHandler-Integrated-4.0" path="*." verb="GET,HEAD,POST,DEBUG,PUT,DELETE,PATCH,OPTIONS" type="System.Web.Handlers.TransferRequestHandler" preCondition="integratedMode,runtimeVersionv4.0" />
+				<add name="Browser Link for HTML" path="*.html" verb="*" type="System.Web.StaticFileHandler, System.Web, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" resourceType="File" preCondition="integratedMode" />
+			</handlers>
+			<staticContent>
+				<remove fileExtension=".woff" />
+				<remove fileExtension=".svg" />
+				<remove fileExtension=".json" />
+				<remove fileExtension=".woff2" />
+				<mimeMap fileExtension=".woff" mimeType="application/font-woff" />
+				<mimeMap fileExtension=".svg" mimeType="image/svg+xml" />
+				<mimeMap fileExtension=".json" mimeType="application/json" />
+				<mimeMap fileExtension=".woff2" mimeType="application/font-woff" />
+				<clientCache cacheControlMode="DisableCache" />
+			</staticContent>
+			<httpProtocol>
+				<customHeaders>
+					<add name="Access-Control-Allow-Origin" value="http://localhost:64255" />
+					<!-- allow mobile project for debugging purposes -->
+					<add name="Access-Control-Allow-Credentials" value="true" />
+					<add name="Access-Control-Allow-Methods" value="GET,PUT,POST,DELETE,OPTIONS" />
+					<add name="Access-Control-Allow-Headers" value="Origin, X-Requested-With, Content-Type, Accept" />
+					<add name="Cache-Control" value="no-store" />
+					<add name="Pragma" value="no-cache" />
+				</customHeaders>
+			</httpProtocol>
+			<rewrite>
+				<rules>
+					<rule name="HTTP to HTTPS redirect" stopProcessing="true">
+						<match url="(.*)"/>
+						<conditions>
+							<add input="{HTTPS}" pattern="off" ignoreCase="true"/>
+						</conditions>
+						<action type="Redirect" redirectType="Permanent" url="https://{HTTP_HOST}/{R:1}"/>
+					</rule>
+					<rule name="Redirect to index.html" stopProcessing="true">
+						<match url="^PlanMember/EZClaim$" />
+						<action type="Redirect" redirectType="Permanent" url="/PlanMember/EZClaim/index.html" />
+					</rule>
+					<rule name="Rewrite ezclaim root to client with page" stopProcessing="true">
+						<match url="^PlanMember/EZClaim/index.html(.*)" />
+						<action type="Rewrite" url="Eclaims{R:1}" />
+					</rule>
+					<rule name="Rewrite ezclaim root to client without page" stopProcessing="true">
+						<match url="^PlanMember/EZClaim/(.*)" />
+						<action type="Rewrite" url="Eclaims/{R:1}" />
+					</rule>
+					<rule name="Rewrite planmemeber eformupload root to client without page" stopProcessing="true">
+						<match url="^PlanMember/DocumentSubmission/(.*)" />
+						<action type="Rewrite" url="eformupload/{R:1}" />
+					</rule>
+					<rule name="Rewrite planadmin eformupload root to client without page" stopProcessing="true">
+						<match url="^PlanAdmin/DocumentSubmission/(.*)" />
+						<action type="Rewrite" url="eformupload/{R:1}" />
+					</rule>
+				</rules>
+			</rewrite>
+		</system.webServer>
+	</location>
+	<location path="." inheritInChildApplications="false">
+		<entityFramework_EquitableHealth>
+			<defaultConnectionFactory type="System.Data.Entity.Infrastructure.SqlConnectionFactory, EntityFramework" />
+		</entityFramework_EquitableHealth>
+	</location>
+	<location path="." inheritInChildApplications="false">
+		<system.serviceModel>
+			<bindings>
+				<basicHttpBinding>
+					<binding closeTimeout="00:01:00" openTimeout="00:01:00" receiveTimeout="00:10:00" sendTimeout="00:05:00" maxBufferPoolSize="2147483647" maxBufferSize="2147483647" maxReceivedMessageSize="2147483647">
+						<readerQuotas maxDepth="32" maxStringContentLength="2147483647" maxArrayLength="2147483647" />
+						<security mode="None" />
+					</binding>
+					<binding name="BasicHttpBinding_IUserService" />
+					<binding name="BasicHttpBinding_IPlanMemberService" />
+					<binding name="BasicHttpBinding_IPdfConverterService" closeTimeout="00:01:00" receiveTimeout="00:15:00" sendTimeout="00:15:00" maxBufferSize="2147483647" maxReceivedMessageSize="2147483647">
+						<readerQuotas maxStringContentLength="2147483647" maxArrayLength="2147483647" />
+						<security mode="Transport" />
+					</binding>
+				</basicHttpBinding>
+				<netTcpBinding>
+					<binding closeTimeout="00:01:00" receiveTimeout="00:15:00" sendTimeout="00:15:00" maxBufferSize="2147483647" maxReceivedMessageSize="2147483647">
+						<readerQuotas maxStringContentLength="2147483647" maxArrayLength="2147483647" />
+						<security mode="None" />
+					</binding>
+				</netTcpBinding>
+			</bindings>
+			<client configSource="ServiceEndpoints.config" />
+		</system.serviceModel>
+	</location>
+	<runtime>
+		<assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+			<dependentAssembly>
+				<assemblyIdentity name="Autofac" publicKeyToken="17863af14b0044da" culture="neutral" />
+				<bindingRedirect oldVersion="0.0.0.0-3.0.0.0" newVersion="3.0.0.0" />
+			</dependentAssembly>
+			<dependentAssembly>
+				<assemblyIdentity name="Moq" publicKeyToken="69f491c39445e920" culture="neutral" />
+				<bindingRedirect oldVersion="0.0.0.0-4.13.0.0" newVersion="4.13.0.0" />
+			</dependentAssembly>
+			<dependentAssembly>
+				<assemblyIdentity name="Newtonsoft.Json" publicKeyToken="30ad4fe6b2a6aeed" culture="neutral" />
+				<bindingRedirect oldVersion="0.0.0.0-12.0.0.0" newVersion="12.0.0.0" />
+			</dependentAssembly>
+		</assemblyBinding>
+	</runtime>
+</configuration>
+======
+
+
+
