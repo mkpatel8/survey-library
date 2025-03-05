@@ -39,3 +39,132 @@
     "questionmatrixdropdownmodel": "matrix-table-with-dropdown-list"
   }
 }
+
+using Microsoft.IdentityModel.Tokens;
+using System;
+using System.Configuration;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Security.Claims;
+using System.Security.Principal;
+using System.Web;
+
+namespace Equitable.EquitableHealth.Web.Security
+{
+    public static class MobileAuthenticationHelper
+    {
+        private static readonly ILog log = LogManager.GetLogger(typeof(MobileAuthenticationHelper));
+        private const string AuthenticatedWithBearerKey = "AuthenticatedWithBearer";
+
+        /// <summary>
+        /// Validates a mobile JWT token and sets up user identity if valid
+        /// </summary>
+        /// <param name="context">The HTTP context</param>
+        /// <returns>True if authentication was successful, false otherwise</returns>
+        public static bool ValidateMobileToken(HttpContext context)
+        {
+            // Skip if already processed in this request
+            if (context.Items[AuthenticatedWithBearerKey] != null)
+            {
+                return (bool)context.Items[AuthenticatedWithBearerKey];
+            }
+
+            var request = context.Request;
+            var authHeader = request.Headers["Authorization"];
+
+            // No Authorization header or not a Bearer token
+            if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Items[AuthenticatedWithBearerKey] = false;
+                return false;
+            }
+
+            try
+            {
+                var token = authHeader.Substring("Bearer".Length).Trim();
+                var handler = new JwtSecurityTokenHandler();
+                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
+
+                if (jsonToken == null)
+                {
+                    log.Error("Invalid JWT token format");
+                    context.Items[AuthenticatedWithBearerKey] = false;
+                    return false;
+                }
+
+                // Validate token expiration
+                if (jsonToken.ValidTo < DateTime.UtcNow)
+                {
+                    log.Error($"JWT token expired. Expiry: {jsonToken.ValidTo}, Current: {DateTime.UtcNow}");
+                    context.Items[AuthenticatedWithBearerKey] = false;
+                    return false;
+                }
+
+                // Validate issuer
+                var expectedIssuer = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/";
+                if (jsonToken.Issuer != expectedIssuer)
+                {
+                    log.Error($"Invalid JWT issuer. Expected: {expectedIssuer}, Actual: {jsonToken.Issuer}");
+                    context.Items[AuthenticatedWithBearerKey] = false;
+                    return false;
+                }
+
+                // Validate audience
+                var mobileClientId = ConfigurationManager.AppSettings["Auth0:MobileClientId"];
+                if (!jsonToken.Audiences.Contains(mobileClientId))
+                {
+                    log.Error($"Invalid JWT audience. Expected: {mobileClientId}, Actual: {string.Join(", ", jsonToken.Audiences)}");
+                    context.Items[AuthenticatedWithBearerKey] = false;
+                    return false;
+                }
+
+                // Get email from token
+                var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "email" || c.Type == "name")?.Value;
+                if (string.IsNullOrEmpty(email))
+                {
+                    log.Error("JWT token does not contain an email claim");
+                    context.Items[AuthenticatedWithBearerKey] = false;
+                    return false;
+                }
+
+                // Get user from database
+                var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
+                string userId = bmsDbUow.Users.GetUserIdFromEmailAddress(email);
+                
+                if (string.IsNullOrEmpty(userId))
+                {
+                    log.Error($"User with email {email} not found");
+                    context.Items[AuthenticatedWithBearerKey] = false;
+                    return false;
+                }
+
+                var userProfileRoles = bmsDbUow.Users.GetProfileRoles(userId);
+                
+                // Create and set identity
+                var identity = new GenericIdentity(userId, "Bearer");
+                
+                // Add claims similar to web authentication
+                var claimsIdentity = new ClaimsIdentity("Bearer");
+                claimsIdentity.AddClaim(new Claim(ClaimTypes.Name, userId));
+                claimsIdentity.AddClaim(new Claim("BMSUserName", userId));
+                claimsIdentity.AddClaim(new Claim(ClaimTypes.Email, email));
+                
+                var principal = new GenericPrincipal(claimsIdentity, userProfileRoles.WebRoles);
+                context.User = principal;
+                
+                // Update the last activity date for the user
+                bmsDbUow.Users.UpdateLastActivityDate(userId, userProfileRoles.SessionGuid);
+                
+                log.Info($"Mobile authentication successful for user: {userId}");
+                context.Items[AuthenticatedWithBearerKey] = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                log.Error("Error validating mobile token", ex);
+                context.Items[AuthenticatedWithBearerKey] = false;
+                return false;
+            }
+        }
+    }
+}
