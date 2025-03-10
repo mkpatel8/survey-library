@@ -40,131 +40,543 @@
   }
 }
 
-using Microsoft.IdentityModel.Tokens;
-using System;
-using System.Configuration;
-using System.IdentityModel.Tokens.Jwt;
-using System.Linq;
-using System.Security.Claims;
-using System.Security.Principal;
-using System.Web;
+# Auth0 Integration with EWeb Project Documentation
 
-namespace Equitable.EquitableHealth.Web.Security
+## Table of Contents
+1. [Background](#background)
+2. [Business Requirements](#business-requirements)
+3. [Previous Authentication Implementation](#previous-authentication-implementation)
+4. [Auth0 Integration Overview](#auth0-integration-overview)
+5. [Key Components](#key-components)
+6. [Implementation Details by Component](#implementation-details-by-component)
+7. [Authentication Flows](#authentication-flows)
+8. [Common Issues and Solutions](#common-issues-and-solutions)
+9. [Cross-Application Authentication Challenges](#cross-application-authentication-challenges)
+10. [Deployment Considerations](#deployment-considerations)
+11. [Testing Recommendations](#testing-recommendations)
+
+## Background
+
+The Equitable Health web application ecosystem consists of multiple projects including EWeb and EHealth. These applications previously used traditional ASP.NET Forms Authentication but now require integration with Auth0 as an identity provider while maintaining backward compatibility with existing code and infrastructure.
+
+## Business Requirements
+
+The integration needed to satisfy the following business requirements:
+
+1. **Maintain Backward Compatibility**: Integrate Auth0 without breaking existing functionality built on Forms Authentication
+2. **Support Multiple Authentication Methods**: Enable both web browser and mobile API authentication flows
+3. **Enhance Security**: Implement modern identity management best practices while maintaining session management
+4. **Cross-Application Navigation**: Allow users to navigate between EWeb and EHealth applications with proper authentication state management
+5. **Role-Based Authorization**: Maintain support for different user roles (Plan Member, Advisor, Plan Admin)
+
+## Previous Authentication Implementation
+
+Before Auth0 integration, the application used standard ASP.NET Forms Authentication:
+
+- **Web.config Configuration**: Forms Authentication was configured in web.config with timeout settings and cookie properties
+- **Custom FormsAuthenticationTicket**: Authentication tickets stored user roles and profile information
+- **Cookie-Based Session Management**: Sessions were tracked using Forms Authentication cookies
+- **Custom Authorization Attributes**: Application used custom authorization attributes for role-based access control
+
+Key limitations of the previous approach:
+- Lack of modern identity protocols (OIDC, OAuth 2.0)
+- Manual handling of encryption and security
+- No centralized identity management across applications
+- Limited support for modern authentication requirements
+
+## Auth0 Integration Overview
+
+The integration approach involves creating a hybrid authentication system that uses Auth0 as the identity provider while preserving the existing Forms Authentication infrastructure for session management and authorization.
+
+### High-Level Architecture
+
+1. **Auth0**: Handles initial user authentication, credential verification, and identity claims
+2. **OWIN Middleware**: Processes Auth0 callbacks and transforms claims into application-specific identity
+3. **Forms Authentication**: Maintains session state and authorization context once authenticated
+4. **HTTP Modules**: Manage session validation, timeout handling, and multi-tab consistency
+
+## Key Components
+
+The integration involves several key components:
+
+1. **AccountController.cs**: Manages login/logout flows and user information retrieval
+2. **Auth0SessionModule.cs**: HTTP module that validates authentication state on each request
+3. **BmsSessionModule.cs**: HTTP module that handles business-specific session requirements
+4. **Startup.cs**: Configures OWIN middleware for Auth0 integration
+5. **FormsAuthentication.cs**: Wrapper around Forms Authentication for cookie management
+6. **LogoutCookieModule.cs**: Ensures consistent cookie cleanup during logout
+
+## Implementation Details by Component
+
+### AccountController.cs
+
+The AccountController manages the authentication process and user session establishment:
+
+```csharp
+public ActionResult Index(string returnUrl, string reset = null)
 {
-    public static class MobileAuthenticationHelper
+    // Handle reset parameter - clear all cookies and state
+    if (!string.IsNullOrEmpty(reset))
     {
-        private static readonly ILog log = LogManager.GetLogger(typeof(MobileAuthenticationHelper));
-        private const string AuthenticatedWithBearerKey = "AuthenticatedWithBearer";
-
-        /// <summary>
-        /// Validates a mobile JWT token and sets up user identity if valid
-        /// </summary>
-        /// <param name="context">The HTTP context</param>
-        /// <returns>True if authentication was successful, false otherwise</returns>
-        public static bool ValidateMobileToken(HttpContext context)
+        foreach (string cookieName in HttpContext.Request.Cookies.AllKeys)
         {
-            // Skip if already processed in this request
-            if (context.Items[AuthenticatedWithBearerKey] != null)
+            var cookie = new HttpCookie(cookieName)
             {
-                return (bool)context.Items[AuthenticatedWithBearerKey];
-            }
-
-            var request = context.Request;
-            var authHeader = request.Headers["Authorization"];
-
-            // No Authorization header or not a Bearer token
-            if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer", StringComparison.OrdinalIgnoreCase))
-            {
-                context.Items[AuthenticatedWithBearerKey] = false;
-                return false;
-            }
-
-            try
-            {
-                var token = authHeader.Substring("Bearer".Length).Trim();
-                var handler = new JwtSecurityTokenHandler();
-                var jsonToken = handler.ReadToken(token) as JwtSecurityToken;
-
-                if (jsonToken == null)
-                {
-                    log.Error("Invalid JWT token format");
-                    context.Items[AuthenticatedWithBearerKey] = false;
-                    return false;
-                }
-
-                // Validate token expiration
-                if (jsonToken.ValidTo < DateTime.UtcNow)
-                {
-                    log.Error($"JWT token expired. Expiry: {jsonToken.ValidTo}, Current: {DateTime.UtcNow}");
-                    context.Items[AuthenticatedWithBearerKey] = false;
-                    return false;
-                }
-
-                // Validate issuer
-                var expectedIssuer = $"https://{ConfigurationManager.AppSettings["Auth0:Domain"]}/";
-                if (jsonToken.Issuer != expectedIssuer)
-                {
-                    log.Error($"Invalid JWT issuer. Expected: {expectedIssuer}, Actual: {jsonToken.Issuer}");
-                    context.Items[AuthenticatedWithBearerKey] = false;
-                    return false;
-                }
-
-                // Validate audience
-                var mobileClientId = ConfigurationManager.AppSettings["Auth0:MobileClientId"];
-                if (!jsonToken.Audiences.Contains(mobileClientId))
-                {
-                    log.Error($"Invalid JWT audience. Expected: {mobileClientId}, Actual: {string.Join(", ", jsonToken.Audiences)}");
-                    context.Items[AuthenticatedWithBearerKey] = false;
-                    return false;
-                }
-
-                // Get email from token
-                var email = jsonToken.Claims.FirstOrDefault(c => c.Type == "email" || c.Type == "name")?.Value;
-                if (string.IsNullOrEmpty(email))
-                {
-                    log.Error("JWT token does not contain an email claim");
-                    context.Items[AuthenticatedWithBearerKey] = false;
-                    return false;
-                }
-
-                // Get user from database
-                var bmsDbUow = DependencyResolver.Current.GetService<IBmsDbUow>();
-                string userId = bmsDbUow.Users.GetUserIdFromEmailAddress(email);
-                
-                if (string.IsNullOrEmpty(userId))
-                {
-                    log.Error($"User with email {email} not found");
-                    context.Items[AuthenticatedWithBearerKey] = false;
-                    return false;
-                }
-
-                var userProfileRoles = bmsDbUow.Users.GetProfileRoles(userId);
-                
-                // Create and set identity
-                var identity = new GenericIdentity(userId, "Bearer");
-                
-                // Add claims similar to web authentication
-                var claimsIdentity = new ClaimsIdentity("Bearer");
-                claimsIdentity.AddClaim(new Claim(ClaimTypes.Name, userId));
-                claimsIdentity.AddClaim(new Claim("BMSUserName", userId));
-                claimsIdentity.AddClaim(new Claim(ClaimTypes.Email, email));
-                
-                var principal = new GenericPrincipal(claimsIdentity, userProfileRoles.WebRoles);
-                context.User = principal;
-                
-                // Update the last activity date for the user
-                bmsDbUow.Users.UpdateLastActivityDate(userId, userProfileRoles.SessionGuid);
-                
-                log.Info($"Mobile authentication successful for user: {userId}");
-                context.Items[AuthenticatedWithBearerKey] = true;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                log.Error("Error validating mobile token", ex);
-                context.Items[AuthenticatedWithBearerKey] = false;
-                return false;
-            }
+                Expires = DateTime.Now.AddDays(-1),
+                Domain = FormsAuthentication.CookieDomain
+            };
+            HttpContext.Response.Cookies.Add(cookie);
         }
+        // Clear session and sign out
+        // ...
+    }
+    
+    // Clear authentication state if inconsistent
+    // ...
+    
+    // Return appropriate view
+    if (!string.IsNullOrEmpty(returnUrl))
+    {
+        return View(returnUrl);
+    }
+    return View("~/Views/Account/Login.cshtml");
+}
+```
+
+Key responsibilities:
+- Provides entry point for login process
+- Handles clearing of authentication state when necessary
+- Redirects users to Auth0 for authentication
+- Processes return from Auth0 and establishes session
+
+Implementation notes:
+- The `Index` method handles both initial login and reset scenarios
+- Inconsistent authentication state is detected and corrected
+- The `Login` method initiates Auth0 challenge
+- The `UserInfo` method processes Auth0 authentication data and establishes Forms Authentication
+
+### Auth0SessionModule.cs
+
+This HTTP module ensures authentication consistency on every request:
+
+```csharp
+public void Init(HttpApplication app)
+{
+    app.PostAcquireRequestState += OnPostAcquireRequestState;
+    app.AuthenticateRequest += OnAuthenticateRequest;
+}
+```
+
+Key responsibilities:
+- Validates authentication state early in request pipeline
+- Handles mobile API token validation
+- Prevents redirect loops
+- Redirects unauthenticated users appropriately
+- Ensures multi-tab consistency
+
+Implementation notes:
+- Uses a redirect counter to prevent infinite loops
+- Special handling for specific paths that don't require authentication
+- Validates both Auth0 and Forms Authentication state
+- Handles mobile API Bearer token authentication
+
+### BmsSessionModule.cs
+
+This module adds business-specific session validation:
+
+```csharp
+private void Application_PostAuthorizeRequest(object source, EventArgs e)
+{
+    // Validate authentication and session state
+    // Handle mobile token authentication
+    // Setup user identity with proper roles
+}
+```
+
+Key responsibilities:
+- Establishes business context after authentication
+- Implements additional business-specific validation
+- Manages role-based identity
+- Updates session activity timestamps
+
+Implementation notes:
+- Works in coordination with Auth0SessionModule
+- Performs additional validation specific to application business rules
+- Updates last activity timestamps for session tracking
+
+### Startup.cs
+
+Configures the OWIN middleware for Auth0 integration:
+
+```csharp
+public void Configuration(IAppBuilder app)
+{
+    // Configure Auth0 parameters
+    string auth0Domain = ConfigurationManager.AppSettings["Auth0:Domain"];
+    string auth0ClientId = ConfigurationManager.AppSettings["Auth0:ClientId"];
+    // ...
+    
+    // Configure cookie authentication
+    app.SetDefaultSignInAsAuthenticationType(CookieAuthenticationDefaults.AuthenticationType);
+    app.UseCookieAuthentication(new CookieAuthenticationOptions
+    {
+        // Cookie authentication options
+    });
+    
+    // Configure Auth0 authentication
+    app.UseOpenIdConnectAuthentication(new OpenIdConnectAuthenticationOptions
+    {
+        // Auth0 configuration options
+    });
+}
+```
+
+Key responsibilities:
+- Configures OWIN authentication middleware
+- Sets up Auth0 OpenID Connect integration
+- Establishes callback handling
+- Transforms Auth0 identity claims to application-specific claims
+
+Implementation notes:
+- Maps Auth0 user information to application user database
+- Configures authentication type mapping
+- Sets up event handlers for authentication events
+- Configures proper cookie settings
+
+### FormsAuthentication.cs
+
+Wraps Forms Authentication for cookie management:
+
+```csharp
+public void SignIn(string userId, bool createPersistentCookie)
+{
+    // Get user profile and roles
+    var userProfileRoles = _bmsDbUow.Users.GetProfileRoles(userId);
+    var userRoles = string.Join(";", userProfileRoles.WebRoles);
+    
+    // Build user data string
+    var userData = userRoles + "|" + userProfile + "|" + TrueClientIP;
+    
+    // Create authentication ticket
+    var ticket = new FormsAuthenticationTicket(
+        1, 
+        userProfileRoles.UserId, 
+        DateTime.Now, 
+        DateTime.Now.AddMinutes(_settings.AuthCookieExpirationInMinutes),
+        createPersistentCookie,
+        userData);
+    
+    // Create and add cookie
+    var authCookie = new HttpCookie(FormsAuth.FormsCookieName, FormsAuth.Encrypt(ticket));
+    // Set cookie properties and add to response
+    // ...
+}
+```
+
+Key responsibilities:
+- Creates properly formatted authentication tickets
+- Manages cookie creation and settings
+- Integrates user roles into authentication ticket
+- Handles sign-out process
+
+Implementation notes:
+- Maintains compatibility with existing authorization code
+- Adds session timestamp cookies for multi-tab management
+- Configures proper cookie security settings
+
+### LogoutCookieModule.cs
+
+Ensures consistent cookie cleanup during logout:
+
+```csharp
+private void OnEndRequest(object sender, EventArgs e)
+{
+    // Check if any logout URL is being accessed
+    if (request.Path.ToLowerInvariant().Contains("/account/logoff") || 
+        request.Path.ToLowerInvariant().Contains("/account/logout"))
+    {
+        // Clear all authentication cookies
+        ClearAllAuthCookies(context);
+        
+        // Clear session
+        if (context.Session != null)
+        {
+            context.Session.Clear();
+            context.Session.Abandon();
+        }
+        
+        // Sign out of Auth0 via OWIN
+        // ...
     }
 }
+```
+
+Key responsibilities:
+- Ensures consistent cookie cleanup across all logout scenarios
+- Cleans up session state
+- Signs out of both Forms Authentication and Auth0
+- Prevents authentication state leakage
+
+Implementation notes:
+- Handles all authentication-related cookies
+- Ensures proper Auth0 signout
+- Centralizes logout logic
+
+## Authentication Flows
+
+### Web Browser Authentication Flow
+
+1. User navigates to application
+2. `Auth0SessionModule` detects unauthenticated state and redirects to `/Account/Index`
+3. `AccountController.Index` renders login page
+4. User initiates login via `/Account/Login`
+5. OWIN middleware challenges Auth0 authentication
+6. Auth0 authenticates user and redirects back to callback URL
+7. Callback URL routes to `AccountController.UserInfo`
+8. `UserInfo` validates user in database and creates Forms Authentication ticket
+9. User is redirected to appropriate home page based on role
+
+### Mobile API Authentication Flow
+
+1. Mobile app authenticates with Auth0 directly and receives JWT token
+2. Mobile app includes token in Authorization header with API requests
+3. `Auth0SessionModule` and `BmsSessionModule` detect and validate token
+4. JWT claims are transformed into application user identity
+5. API request proceeds with authenticated identity
+
+## Common Issues and Solutions
+
+### Cookie Cleanup Inconsistency
+
+**Issue**: Inconsistent cookie cleanup during logout leads to authentication state inconsistencies.
+
+**Solution**: Centralize cookie cleanup in `LogoutCookieModule` and ensure all authentication-related cookies are properly expired:
+
+```csharp
+private void ClearAllAuthCookies(HttpContext context)
+{
+    // Clear comprehensive list of cookies with proper domain and path
+    string[] cookiesToClear = new string[] {
+        FormsAuthentication.FormsCookieName,
+        "SessionTimestamp",
+        // Other application cookies
+    };
+    
+    foreach (string cookieName in cookiesToClear)
+    {
+        var cookie = new HttpCookie(cookieName)
+        {
+            Expires = DateTime.Now.AddDays(-1),
+            Domain = FormsAuthentication.CookieDomain,
+            Secure = FormsAuthentication.RequireSSL,
+            HttpOnly = true,
+            SameSite = SameSiteMode.None
+        };
+        context.Response.Cookies.Add(cookie);
+    }
+    
+    // Also clear ASP.NET auth cookies
+    // ...
+}
+```
+
+### Multi-Tab Authentication Issues
+
+**Issue**: Logging out in one tab while other tabs remain open can lead to inconsistent authentication state.
+
+**Solution**: Implement session timestamp cookies to detect stale authentication state:
+
+```csharp
+// When creating authentication
+var sessionTimestampCookie = new HttpCookie("SessionTimestamp", DateTime.UtcNow.Ticks.ToString());
+sessionTimestampCookie.Domain = FormsAuth.CookieDomain;
+sessionTimestampCookie.Secure = FormsAuth.RequireSSL;
+sessionTimestampCookie.SameSite = SameSiteMode.None;
+sessionTimestampCookie.HttpOnly = true;
+response.Cookies.Add(sessionTimestampCookie);
+
+// When validating authentication
+if (authCookie != null && timestampCookie == null)
+{
+    // Inconsistent state - force re-authentication
+    ClearAuthenticationState(app.Context);
+    RedirectToAuth0(app.Context);
+    return;
+}
+```
+
+### Redirect Loops
+
+**Issue**: Authentication redirects can sometimes create infinite loops.
+
+**Solution**: Implement redirect counting and circuit breaker:
+
+```csharp
+//Check for redirect loop by counting redirects
+var redirectCountCookie = request.Cookies["RedirectCount"];
+int redirectCount = 0;
+
+if (redirectCountCookie != null)
+{
+    int.TryParse(redirectCountCookie.Value, out redirectCount);
+}
+
+//If too many redirects, clear everything and go to a safe page
+if (redirectCount > 10)
+{
+    // Clear cookies and redirect to reset page
+    // ...
+}
+```
+
+### IP Address Changes
+
+**Issue**: User's IP address changing during a session can cause authentication failures.
+
+**Solution**: Decide whether to enforce IP validation or make it configurable:
+
+```csharp
+// Only enforce IP validation if configured to do so
+if (_settings.EnforceIpValidation && TrueClientIP != authCookieInfo.TrueClientIP)
+{
+    // Clear authentication state
+    // ...
+}
+```
+
+## Cross-Application Authentication Challenges
+
+### Authentication State Between EWeb and EHealth
+
+One significant challenge is maintaining proper authentication state when navigating between EWeb (Advisor/Plan Admin) and EHealth (Plan Member) applications.
+
+#### Observed Issues
+
+1. **Inconsistent Redirection**: When logging out in one tab and logging in as a different user type in another, links in the first tab behave inconsistently
+2. **Redirect Loops**: Specific navigation patterns can create redirect loops between applications
+3. **Project-Specific Authentication Logic**: Each application has unique authentication requirements
+
+#### Solutions
+
+1. **Application Awareness in Authentication Ticket**:
+   ```csharp
+   // Include application identifier in authentication ticket
+   var userData = userRoles + "|" + userProfile + "|" + TrueClientIP + "|" + _settings.ApplicationName;
+   ```
+
+2. **Cross-Application Cookie Management**:
+   ```csharp
+   // Clear cookies for both applications
+   string[] cookiesToClear = new string[] { 
+       FormsAuthentication.FormsCookieName, 
+       "SessionTimestamp",
+       "EHealth.SessionId",
+       "EWeb.SessionId",
+       // Other application cookies
+   };
+   ```
+
+3. **Client-Side Detection of Application Changes**:
+   ```javascript
+   // Add to master page
+   document.addEventListener('DOMContentLoaded', function() {
+       var currentApp = 'EHealth'; // Or 'EWeb'
+       var lastApp = localStorage.getItem('lastApplication');
+       
+       if (lastApp && lastApp !== currentApp) {
+           // Force fresh auth state
+           window.location.href = '/Account/Index?reset=true';
+       } else {
+           localStorage.setItem('lastApplication', currentApp);
+       }
+   });
+   ```
+
+## Deployment Considerations
+
+### Configuration
+
+1. **Auth0 Settings**: Ensure proper configuration of Auth0 settings in web.config:
+   ```xml
+   <appSettings>
+       <add key="Auth0:Domain" value="your-tenant.auth0.com" />
+       <add key="Auth0:ClientId" value="your-client-id" />
+       <add key="Auth0:ClientSecret" value="your-client-secret" />
+       <add key="Auth0:RedirectUri" value="https://your-app/callback" />
+       <add key="Auth0:PostLogoutRedirectUri" value="https://your-app/account/index" />
+   </appSettings>
+   ```
+
+2. **OWIN Configuration**: Ensure proper OWIN startup configuration:
+   ```xml
+   <add key="owin:AppStartup" value="Equitable.EquitableHealth.Web.Startup" />
+   ```
+
+3. **Forms Authentication Settings**: Maintain Forms Authentication settings:
+   ```xml
+   <authentication mode="Forms">
+     <forms loginUrl="~/Account/Index" timeout="2880" />
+   </authentication>
+   ```
+
+### Security Considerations
+
+1. **Cookie Security**: Ensure all cookies have appropriate security settings:
+   - Secure flag enabled
+   - HttpOnly flag enabled
+   - SameSite configured appropriately
+   - Proper domain restrictions
+
+2. **JWT Validation**: Ensure proper validation of JWT tokens:
+   - Issuer validation
+   - Audience validation
+   - Expiration validation
+   - Signature validation
+
+3. **CSRF Protection**: Implement anti-CSRF measures:
+   - Include anti-forgery tokens in forms
+   - Validate tokens on state-changing operations
+
+## Testing Recommendations
+
+Thorough testing is critical for this hybrid authentication system. Test cases should include:
+
+1. **Basic Authentication Flows**:
+   - New user login
+   - Return user login
+   - Password reset
+   - Account lockout
+   - Session timeout
+   - Explicit logout
+
+2. **Multi-Tab Scenarios**:
+   - Login in one tab, navigate in another
+   - Logout in one tab, navigate in another
+   - Login as different users in different tabs
+
+3. **Cross-Application Navigation**:
+   - Login to EWeb, navigate to EHealth
+   - Login to EHealth, navigate to EWeb
+   - Logout from one application while using both
+
+4. **Edge Cases**:
+   - Session timeout during active use
+   - Network disconnection during authentication
+   - Auth0 service unavailability
+   - Database unavailability
+
+5. **Mobile API Authentication**:
+   - Token acquisition
+   - API access with valid token
+   - API access with expired token
+   - Token refresh
+
+## Conclusion
+
+The integration of Auth0 with the existing Forms Authentication system creates a robust hybrid authentication solution that leverages the benefits of modern identity providers while maintaining compatibility with existing application infrastructure.
+
+This approach balances the need for enhanced security with the practical realities of evolving an established application ecosystem. While there are challenges in maintaining consistent authentication state across tabs and applications, careful implementation of the strategies outlined in this document can create a reliable authentication experience for users.
+
+---
+
+*This document was created based on analysis of the authentication implementation. It should be maintained and updated as the implementation evolves.*
