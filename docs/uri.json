@@ -40,3 +40,2855 @@
   }
 }
 
+'-----------------------------------------------------------------------------------------------
+'FILE: Global.asax.vb
+'
+'-----------------------------------------------------------------------------------------------
+'COPYRIGHT NOTIFICATION
+'
+'These materials (including without limitation all articles, text, images, logos, software, code 
+'and design) are copyright © 1996-2006 to The Equitable Life Insurance Company of Canada. 
+'All rights reserved. 
+'These materials may not otherwise be copied, transferred, redistributed, rewritten, reproduced in 
+'whole or in part, for commercial or noncommercial purposes or for compensation of any kind, in any 
+'form or medium, without the express written permission of The Equitable Life Insurance Company of 
+'Canada.
+'Any use of these materials is expressly prohibited by law, and may result in severe civil and criminal 
+'penalties. Violators will be prosecuted to the maximum extent possible.
+'
+'If you have questions about these terms, or would like information about licensing materials from 
+'The Equitable Life Insurance Company of Canada, please send an e-mail to legal@equitable.ca.
+'
+'	Equitable Life of Canada
+'	One Westmount Road North
+'	Waterloo,Ontario
+'	Canada, N2J 4C7
+'
+'-----------------------------------------------------------------------------------------------
+'Author:        Allan Tolentino
+'Creation Date: 06/22/2004
+'
+'Purpose:       Contains application level logic and event handling
+'
+'-----------------------------------------------------------------------------------------------
+'Updates:       16-Feb-10 LP MAPS 124, Changes to Application_BeginRequest, LogActivity,
+'                                      ValidateSessionGUID, SetLanguageSupport and GetCultureInfo
+'                                      to support French translation requirements
+'              22-Mar-10 LP MAPS 124, Changes to Global_AcquireRequestState
+'              29-Mar-10 LP Maps 124 Defect 1269 - Changes to Global_AcquireRequestState
+'              5-April-10 LP MAPS 124 Rollback of toggle; removed Global_AcquireRequestState
+'              7-April-10 LP MAPS 124 Defect 1294 - Force English on log in if user is a Plan Admin or Advisor (ValidateSessionGUID)
+'              10-May-2010 LP MAPS 124 Defect 1355 - Change Application_BeginRequest to validate langID param prior to usage
+'              12-July-2010 LL MAPS 538 - Removed Force English on log in if user is a Plan Admin or Advisor 
+'-----------------------------------------------------------------------------------------------
+Imports System.Threading
+Imports System.Globalization
+Imports System.Security.Principal
+Imports System.Web.Security
+Imports System.Security.Cryptography
+Imports System.Security.Cryptography.SHA1CryptoServiceProvider
+Imports IN3.Frameworks.ExceptionHandling
+Imports IN3.Frameworks.Telemetry
+Imports IN3.BMSWeb.Service.Caching
+Imports IN3.BMSWeb.Service.Context
+Imports IN3.BMSWeb.Service.Security
+Imports IN3.BMSWeb.Service.Session
+Imports IN3.BMSWeb.Common
+Imports IN3.BMSWeb.WebUI
+Imports log4net
+Imports System.Web.Routing
+Imports IN3Ctl = IN3.BMSWeb.WebUI.WebControls
+Imports IN3Biz = IN3.BMSWeb.Business
+
+Public Class [Global]
+    Inherits System.Web.HttpApplication
+
+    Private Shared Logger As ILog = LogManager.GetLogger(GetType([Global]))
+
+#Region " Component Designer Generated Code "
+
+    Public Sub New()
+        MyBase.New()
+
+        'This call is required by the Component Designer.
+        InitializeComponent()
+
+        'Add any initialization after the InitializeComponent() call
+
+    End Sub
+
+    'Required by the Component Designer
+    Private components As System.ComponentModel.IContainer
+
+    'NOTE: The following procedure is required by the Component Designer
+    'It can be modified using the Component Designer.
+    'Do not modify it using the code editor.
+    <System.Diagnostics.DebuggerStepThrough()> Private Sub InitializeComponent()
+        components = New System.ComponentModel.Container
+    End Sub
+
+#End Region
+
+#Region "--- Event Handlers ---"
+
+    Sub Application_Start(ByVal sender As Object, ByVal e As EventArgs)
+
+        RouteTable.Routes.MapPageRoute("Default", "", "~/Default.aspx")
+
+        log4net.Config.XmlConfigurator.Configure()
+
+        EventLogger.WriteEntry("BMSWeb Application was started.", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+
+        'Load the list of supported languages into the application variable
+        Dim language As DataTable = CacheManager.GetCodeList(Constant.CodeGroup.Language, 1)
+
+        Application.Add(Constant.CodeTable.SysLanguage, language)
+    End Sub
+
+    Sub Application_BeginRequest(ByVal sender As Object, ByVal e As EventArgs)
+        Try
+            Logger.Debug("Application_BeginRequest starting")
+
+            Dim language As String = String.Empty
+
+            'JRIZ 15Oct04 - Microsoft additional canonicalization safeguards to your Web application
+            '               Help reduce canonicalization issues for a Web application 
+            '               The event handler helps protect against invalid characters and malformed 
+            '               URLs by performing path verifications to help protect against common 
+            '               canonicalization issues.  http://support.microsoft.com/kb/887459
+            If (Request.Path.IndexOf(Chr(92)) >= 0 Or _
+                System.IO.Path.GetFullPath(Request.PhysicalPath) <> Request.PhysicalPath) Then
+                Logger.Error("Canonicalization Safeguard")
+                Throw New HttpException(404, "Not Found")
+            End If
+            'JRIZ - MS Patch
+
+            'Check if in batch window, system is not available during this period
+            If CheckSystemAvailable() Then
+                Logger.Debug("System is available")
+
+                Dim cookie As HttpCookie = HttpContext.Current.Request.Cookies(Constant.CookieName.SiteContext)
+                Dim setLanguageID As Boolean = False
+                Dim langID As Int16 = Constant.LanguageIDs.French
+
+                ' 16-Feb-10 LP MAPS 124 Manage redirect from equitablesante.ca
+                If Request.Cookies.Count <= 1 Then
+                    If Request.AppRelativeCurrentExecutionFilePath = "~/RedirRoot/Redir.aspx" Then
+                        Logger.Debug("Managing redirect from equitablesante.ca")
+                        Dim param As String = QueryString.GetString(Constant.QueryStringKey.LanguageID)
+
+                        ' If page making the Request is Redir.aspx, it is most likely traffic coming from
+                        ' equitablesante.ca, so set default language to French and check if param is valid
+                        If Not param Is Nothing AndAlso Not param = "" Then
+                            ' LP 10-May-2010 MAPS 124 Defect 1355 - check if param is numeric; if not, use French.
+                            If IsNumeric(param) Then
+                                If UserSiteContext.LanguageIDExists(param) Then
+                                    ' Set the language to the param value
+                                    langID = param
+                                End If
+                            Else
+                                ' Default to French, since this is currently the only usage for Redir.aspx
+                                langID = Constant.LanguageIDs.French
+                            End If
+                        End If
+
+                        ' We only want to set the language in this fashion if coming from Redir.aspx
+                        setLanguageID = True
+                    End If
+                End If
+
+                ContextManager.Attach()
+
+                If setLanguageID Then
+                    Logger.DebugFormat("Setting context languageID to {0}", langID)
+
+                    ' Set the language ID in the cookie (default is French)
+                    ContextManager.UserSiteContext.LanguageID = langID
+
+                    ' Set the language code in the cookie
+                    Select Case langID
+                        Case Constant.LanguageIDs.French
+                            ContextManager.UserSiteContext.LanguageCode = Constant.LanguageCodes.French
+                        Case Else
+                            ContextManager.UserSiteContext.LanguageCode = Constant.LanguageCodes.English
+                    End Select
+                End If
+
+                'edv 11/02/2005: Override the language context when language parameter is passed.
+                ' This is to support multiple website (for every language) redirection to the 
+                ' main website.
+                If Request.Params(Constant.QueryStringKey.Language) <> "" Then
+                    Logger.Debug("Language querystring key detected")
+
+                    ' 18-Jan-09 LP MAPS 124 - Check value of lang querystring value.  If invalid, set to default language in config file.
+                    Dim targetLanguage As String = Request.Params(Constant.QueryStringKey.Language).Trim.ToLower
+
+                    ' If the lang parameter is invalid, u8se the default
+                    If Not UserSiteContext.LanguageCodeExists(targetLanguage) Then
+                        targetLanguage = SystemConfiguration.DefaultLanguage
+                    End If
+
+                    Logger.DebugFormat("Setting context language code to {0}", targetLanguage)
+
+                    ' Set the languageCode context item
+                    ContextManager.UserSiteContext.LanguageCode = targetLanguage
+
+                    ' Set the languageID context item
+                    Select Case targetLanguage
+                        Case Constant.LanguageCodes.French
+                            Logger.DebugFormat("Setting context languageID to {0}", Constant.LanguageIDs.French)
+                            ContextManager.UserSiteContext.LanguageID = Constant.LanguageIDs.French
+                        Case Else
+                            Logger.DebugFormat("Setting context languageID to {0}", Constant.LanguageIDs.English)
+                            ContextManager.UserSiteContext.LanguageID = Constant.LanguageIDs.English
+                    End Select
+
+                    ' Save the new context settings
+                    ContextManager.Save()
+
+                End If
+
+                Logger.Debug("Loading language and culture settings")
+
+                ' load language and culture settings
+                SetLanguageSupport()
+
+            Else
+                Logger.Warn("Site activity while system is not available")
+
+                HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.SystemNotAvailable
+                HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: System not available; Request URL: " & Request.Url.AbsolutePath
+                HttpContext.Current.Items(Constant.ActivityContext.FormID) = Constant.FormID.WUSMsgSystemNotAvailable
+                HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Business
+                HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpSeverity) = Constant.RequestActionOpSeverity.None
+                HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+                LogActivity()
+
+                'edv 06/16/2005: 
+                'if in batch window, check the batch window mode. if mode is block then display a message
+                'to notify the user that the system is not available. if mode is readonly (future) then 
+                'allow the user to access readonly pages.
+                Response.Redirect(String.Format("~/{0}{1}/{2}/Common/Pages/SystemNotAvailable.htm", Constant.SiteFolderPath.Carrier, SystemConfiguration.ContactUs.CarrierCode, SetLanguageSupport))
+            End If
+
+            ' 18-Feb-10 LP MAPS 124 - Check for any invalid URL characters to try to prevent Cross Site Scripting attacks
+            CheckForInvalidURLCharacters()
+
+            Logger.Debug("Application_BeginRequest finished")
+        Catch ex As Exception
+            ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->Application_BeginRequest"), ex)
+        End Try
+    End Sub
+
+
+    Sub Application_AuthenticateRequest(ByVal sender As Object, ByVal e As EventArgs)
+        Logger.Debug("Application_AuthenticateRequest starting")
+
+        If SystemConfiguration.SSLRequired AndAlso (Not Request.IsSecureConnection) Then
+            Logger.Warn("System configuration SSLRequired is true but request connection is not secure - redirecting to https.")
+            Response.Redirect(Request.Url.ToString().Replace("http:", "https:"), True)
+            Return
+        End If
+
+        Logger.Debug("Authenticating user")
+        If SecurityManager.IsAuthenticated() Then
+            Logger.Debug("Security manager authenticated user")
+
+            'edv 02/09/2005: attachPrincipal checks whether the auth cookie has expired
+            Logger.Debug("Checking whether auth cookie has expired")
+            Dim User As String = ""
+            Dim SecurityRole As String = ""
+
+            If Not (SecurityManager.SessionProfile Is Nothing) Then
+                User = SecurityManager.SessionProfile.UserID
+                SecurityRole = SecurityManager.SessionProfile.SecurityRole
+            End If
+
+            If SecurityManager.AttachPrincipal(HttpContext.Current.Request.Cookies(FormsAuthentication.FormsCookieName)) Then
+                Logger.Debug("Auth cookie is valid")
+                ValidateSessionGUID()
+            Else
+                Logger.Warn("Auth cookie has expired - displaying signout message")
+                SecurityManager.ClearCookies()
+                FormUtility.DisplaySignoutMessage(Constant.FormID.WUSMsgSessionTimedOut)
+            End If
+
+            If User <> "" Then
+                SecurityManager.SessionProfile.UserID = User
+            End If
+
+            If SecurityRole <> "" Then
+                SecurityManager.SessionProfile.SecurityRole = SecurityRole
+            End If
+
+        Else
+            Logger.Debug("Security manager has identified non-authenticated user.")
+
+            Dim publicPages() As String = { _
+                     "DEFAULT.ASPX", _
+                     "SIGNIN.ASPX", _
+                     "ACTIVATION.ASPX", _
+                     "ACTIVATIONCONDITION.ASPX", _
+                     "MAIN.ASPX", _
+                     "POPUPMAIN.ASPX", _
+                     "MESSAGE.ASPX", _
+                     "CONTACTUS.ASPX", _
+                     "ABOUT.ASPX", _
+                     "FORGOTPASSWORD.ASPX", _
+                     "WIZARD.ASPX", _
+                     "PRIVACY.ASPX", _
+                     "TERMS.ASPX", _
+                     "MAP.ASPX", _
+                     "EMAILUS.ASPX", _
+                     "DIALOGBOX.ASPX", _
+                     "DIALOGXML.ASPX", _
+                     "CACHEVIEWER.ASPX", _
+                     "SIGNINEXTERNAL.ASPX", _
+                     "TECHREQUIREMENTS.ASPX"}
+
+            If Not Request.Url.Segments(Request.Url.Segments.Length - 1).EndsWith(".axd", StringComparison.OrdinalIgnoreCase) AndAlso _
+               Array.IndexOf(publicPages, Request.Url.Segments(Request.Url.Segments.Length - 1).ToUpper()) < 0 Then
+
+                Logger.WarnFormat("Url {0} does not match any publicly available content - access denied.", Request.Url)
+
+                FormUtility.DisplayMessage(Constant.FormID.WUSMsgAccessDenied, False)
+            End If
+        End If
+
+        Logger.Debug("Application_AuthenticateRequest finished")
+    End Sub
+
+    ''' <summary>
+    ''' Inspects the values of the querystring keys, comparing against InvalidURLCharacters string in web.config.  If invalid character is detected,
+    ''' log warning in event log and throw Technical Difficulties message
+    ''' </summary>
+    ''' <remarks>18-Feb-10 LP MAPS 124</remarks>
+    Sub CheckForInvalidURLCharacters()
+        Try
+            Logger.Debug("CheckForInvalidURLCharacters starting")
+
+            ' Only perform the check if QueryString keys are present
+            If Request.QueryString.Keys.Count > 0 Then
+                Logger.Debug("Querystring has keys so check for invalid chars")
+
+                ' Get list of invalid chars from web.config
+                Dim InvalidURLChars As Array = Split(SystemConfiguration.InvalidURLChars, ",")
+                Dim InvalidURLCharString As String = ""
+
+                ' Only perform the check if there are Invalid URL Chars present in web.config
+                If InvalidURLChars.Length > 0 Then
+                    For i As Integer = 0 To InvalidURLChars.Length - 1
+                        Dim CurrentURLChar As String = InvalidURLChars(i)
+                        Dim URLChar As Integer = 0
+
+                        ' Only accept numeric values
+                        If IsNumeric(CurrentURLChar) Then
+                            ' Convert to Int32
+                            URLChar = Convert.ToInt32(CurrentURLChar)
+                            ' Convert to char
+                            InvalidURLCharString += Convert.ToChar(URLChar)
+                        End If
+                    Next
+
+                    ' Check for each key
+                    For Each key As String In Request.QueryString.Keys
+                        ' Check if the value includes
+                        If Request.QueryString.GetValues(key)(0).ToString.Length > 0 Then
+                            ' Break the value into a char array so that we can inspect each character
+                            Dim keyCharArray As Array = Request.QueryString.GetValues(key)(0).ToString.ToCharArray
+
+                            For Each keyChar As String In keyCharArray
+                                If InvalidURLCharString.Contains(keyChar) Then
+                                    Logger.WarnFormat("Invalid characters detected in the requested URL '{0}'", Request.Url)
+
+                                    ' Set the Description of the Activity Context (will display in X00ActivityLog)
+                                    HttpContext.Current.Items(Constant.ActivityContext.Description) = String.Format("Invalid characters detected in the requested URL '{0}'", Request.RawUrl)
+                                    LogURLActivity()
+
+                                    ' Don't bother looping after finding the first invalid character
+                                    Exit For
+                                End If
+                            Next
+
+                        End If
+                    Next
+                End If
+            End If
+
+            Logger.Debug("CheckForInvalidURLCharacters finished")
+        Catch ex As Exception
+            ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->Application_CheckForInvalidURLCharacters"), ex)
+        End Try
+    End Sub
+
+    Sub LogActivity()
+        Try
+            Logger.Debug("LogActivity starting")
+
+            Dim entityLevel As Int16
+            Dim entityID As Int32
+            Dim errorCd As String = String.Empty
+            Dim operatorDesc As String = String.Empty
+            Dim userID As String = ""
+            Dim securityRole As String = ""
+            Dim languageCode As String = ""
+            Dim languageID As Int16 = 0
+
+            ' 2-Feb-10 LP MAPS 124 - Add defaults in case session and context do not exist yet
+            If Not SecurityManager.SessionProfile Is Nothing Then
+                userID = SecurityManager.SessionProfile.UserID
+                securityRole = SecurityManager.SessionProfile.SecurityRole
+            Else
+                userID = SecurityManager.GetGuestAccount
+                'edv 02/08/2006: set the user role code to WEBADMINISTRATOR for unauthenticated users. 
+                securityRole = "WEBADMINISTRATOR"
+
+                If HttpContext.Current.Items(Constant.CookieName.SiteContext) Is Nothing Then
+                    ' Get the language info from web.config
+                    languageCode = SystemConfiguration.DefaultLanguage
+                    languageID = SystemConfiguration.DefaultLanguageID
+                Else
+                    ' get user language from context
+                    languageCode = ContextManager.UserSiteContext.LanguageCode
+                    languageID = ContextManager.UserSiteContext.LanguageID
+                End If
+
+            End If
+
+            Logger.DebugFormat("UserID: {0}" & Environment.NewLine & _
+                               "LanguageID: {1}" & Environment.NewLine & _
+                               "UserHostAddress: {2}" & Environment.NewLine & _
+                               "ApplicationID: {3}" & Environment.NewLine & _
+                               "RequestType: {4}" & Environment.NewLine & _
+                               "ModuleCode: {5}" & Environment.NewLine & _
+                               "FormID: {6}" & Environment.NewLine & _
+                               "SecurityRole: {7}" & Environment.NewLine & _
+                               "EntityLevel: {8}" & Environment.NewLine & _
+                               "EntityID: {9}" & Environment.NewLine & _
+                               "ReqActionOpStatus: {10}" & Environment.NewLine & _
+                               "ReqActionOpSeverity: {11}" & Environment.NewLine & _
+                               "ReqErrorType: {12}" & Environment.NewLine & _
+                               "ErrorCd: {13}" & Environment.NewLine & _
+                               "OperatorDesc: {14}" & Environment.NewLine & _
+                               "MachineName: {15}" & Environment.NewLine & _
+                               "BrowserPlatform: {16}" & Environment.NewLine & _
+                               "BrowserType: {17}" & Environment.NewLine & _
+                               "BrowserVersion {18}" & Environment.NewLine & _
+                               "ContextDescription {19}" & Environment.NewLine, _
+                           userID, _
+                           languageID, _
+                           Request.UserHostAddress, _
+                           Constant.Application.ID, _
+                           ContextItem.GetInt16(Constant.ActivityContext.RequestType), _
+                           Constant.ModuleCode.WebUser, _
+                           ContextItem.GetInt32(Constant.ActivityContext.FormID), _
+                           securityRole, _
+                           entityLevel, _
+                           entityID, _
+                           ContextItem.GetInt16(Constant.ActivityContext.ReqActionOpStatus), _
+                           ContextItem.GetInt16(Constant.ActivityContext.ReqActionOpSeverity), _
+                           ContextItem.GetInt16(Constant.ActivityContext.ReqErrorType), _
+                           errorCd, _
+                           operatorDesc, _
+                           Server.MachineName, _
+                           Request.Browser.Platform, _
+                           Request.Browser.Type, _
+                           Request.Browser.Version, _
+                           ContextItem.GetString(Constant.ActivityContext.Description))
+
+            If (Not String.IsNullOrWhiteSpace(securityRole)) Then
+                SecurityManager.LogActivity( _
+                      userID, _
+                      languageID, _
+                      Request.UserHostAddress, _
+                      Constant.Application.ID, _
+                      ContextItem.GetInt16(Constant.ActivityContext.RequestType), _
+                      Constant.ModuleCode.WebUser, _
+                      ContextItem.GetInt32(Constant.ActivityContext.FormID), _
+                      securityRole, _
+                      entityLevel, _
+                      entityID, _
+                      ContextItem.GetInt16(Constant.ActivityContext.ReqActionOpStatus), _
+                      ContextItem.GetInt16(Constant.ActivityContext.ReqActionOpSeverity), _
+                      ContextItem.GetInt16(Constant.ActivityContext.ReqErrorType), _
+                      errorCd, _
+                      operatorDesc, _
+                      Server.MachineName, _
+                      Request.Browser.Platform, _
+                      Request.Browser.Type, _
+                      Request.Browser.Version, _
+                      ContextItem.GetString(Constant.ActivityContext.Description) _
+                      )
+            End If
+
+            Logger.Debug("LogActivity finished")
+        Catch ex As Exception
+            ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->LogActivity"), ex)
+        End Try
+    End Sub
+
+    ''' <summary>
+    ''' Performs the actions necessary when invalid characters are detected on the URL
+    ''' </summary>
+    ''' <remarks>2-Feb-10 LP MAPS 124</remarks>
+    Sub LogURLActivity()
+        Try
+            Logger.Debug("LogURLActivity starting")
+
+            ' Log in X00ActivityLog
+            LogActivity()
+
+            ' Publish to event log as a warning
+            EventLogger.WriteEntry(HttpContext.Current.Items(Constant.ActivityContext.Description), Diagnostics.EventLogEntryType.Warning, SystemConfiguration.EventLogSource)
+
+            Logger.Debug("Redirecting to technical difficulties")
+            Dim RedirectURL As String = String.Format("~/{0}{1}/{2}/Common/Pages/TechnicalDifficulty.htm", Constant.SiteFolderPath.Carrier, SystemConfiguration.ContactUs.CarrierCode, SetLanguageSupport)
+
+            ' Redirect to technical difficulty page in current browser language
+            Response.Redirect(RedirectURL, False)
+        Catch ex As Exception
+            ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->LogURLActivity"), ex)
+        End Try
+    End Sub
+
+    Sub Application_EndRequest(ByVal sender As Object, ByVal e As EventArgs)
+
+        Logger.Debug("Application_EndRequest starting")
+
+        ' 24-July-09 LP Defect 262
+        ' Changed from "If Response.RedirectLocation is Nothing" when migrating to 3.5 framework
+        If Not Response.IsRequestBeingRedirected Then
+            ' 13-June 2012 LP prevent logging of errors by wrapping in a try/catch
+            Try
+                ContextManager.Save()
+            Catch ex As Exception
+            End Try
+        End If
+
+        If SecurityManager.IsAuthenticated Then
+            Dim authCookie As String = FormsAuthentication.FormsCookieName
+
+            For Each cookie As String In Response.Cookies
+                If cookie.Equals(authCookie) Then
+                    Response.Cookies(cookie).Path += ";HttpOnly"
+                End If
+            Next
+        End If
+
+        If Application.Item("ShowBatchWindowWarning") = True Then
+            Logger.Debug("Showing batch window warning")
+
+            Dim pagesExcepted As String = "MAIN.ASPX" & "POPUPMAIN.ASPX"
+
+            If pagesExcepted.IndexOf(Request.Url.Segments(Request.Url.Segments.Length - 1).ToUpper) < 0 Then
+                Dim format As System.Globalization.DateTimeFormatInfo
+                Dim formatString As String
+                Dim endTime As DateTime = HttpContext.Current.Items("EndTime")
+                Dim endTimeString As String = ""
+                Dim cookie As HttpCookie = HttpContext.Current.Items("WarningTime")
+
+                'HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.BatchWindowWarning
+                'HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: Batch window warning; Request URL: " & Request.Url.AbsolutePath
+                'HttpContext.Current.Items(Constant.ActivityContext.FormID) = 0
+                'HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Business
+                'HttpContext.Current.Items(Constant.ActivityContext.ReqActionOp) = Constant.RequestActionOpSeverity.None
+                'HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+                'LogActivity()
+
+                HttpContext.Current.Response.Cookies.Add(cookie)
+
+                endTimeString = endTime.ToUniversalTime.ToString("yyyy.MM.dd.HH.mm.ss")
+
+                format = System.Threading.Thread.CurrentThread.CurrentCulture.DateTimeFormat
+                formatString = format.ShortDatePattern & " " & format.ShortTimePattern
+
+                HttpContext.Current.Response.Write("<script language='javascript'>window.top.ph_AlertBatchWindow('" & HttpContext.Current.Items("TimeLeft") & "','" & endTimeString & "','" & formatString & "');</script>")
+            End If
+        End If
+    End Sub
+
+    Sub Application_Error(ByVal sender As Object, ByVal e As EventArgs)
+        Try
+            Logger.Debug("Application_Error starting")
+
+            Dim errors() As Exception
+
+            errors = HttpContext.Current.AllErrors()
+
+            If Not errors Is Nothing Then
+                For Each ex As Exception In errors
+                    If ex.Message = "File does not exist." Then
+                        ex = New Exception(String.Format("{0} {1}", ex.Message, HttpContext.Current.Request.Url.ToString()), ex)
+                    End If
+
+                    ExceptionManager.Publish(ex)
+                Next
+            End If
+
+            ShowError()
+
+            Logger.Debug("Application_Error finished")
+        Catch ex As Exception
+            Logger.Error(ex) 'Avoid throwing another error and causing a loop
+        End Try
+    End Sub
+
+    Sub Application_End(ByVal sender As Object, ByVal e As EventArgs)
+        EventLogger.WriteEntry("BMSWeb Application was stopped.", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+    End Sub
+
+#End Region
+
+#Region "--- Methods ---"
+
+    ' Purpose :
+
+    Sub ValidateSessionGUID()
+        Logger.Debug("ValidateSessionGUID starting")
+
+        Dim returnValue As Int16 = 0
+        Dim lastCallMins As Int32
+        Dim sessionMins As Int16
+        Dim securityRole As String
+        Dim sessionGUID As String
+        Dim userStatus As Int16
+
+        ' 1-Feb-10 LP MAPS 124 Added LanguageID param 
+        Logger.Debug("Getting user profile session")
+        Dim ds As DataSet = SecurityManager.GetUserProfileSession( _
+                 SecurityManager.GetGuestAccount, _
+                 ContextManager.UserSiteContext.LanguageID, _
+                 SecurityManager.SessionProfile.UserID, _
+                 SecurityManager.SessionProfile.SessionGUID, _
+                 ContextManager.UserSiteContext.LanguageID _
+                 )
+
+        'Validate session
+        If (Not ds Is Nothing) AndAlso (ds.Tables(0).Rows.Count > 0) Then
+            Logger.Debug("User profile session found")
+
+            'edv 06/01/2005: user profile has two security role code; BMSWeb uses "WebSecRoleCode"
+            lastCallMins = SQLFieldReader.ReadInt32(ds.Tables(0).Rows(0), Constant.SessionValidation.LastCallMins)
+            sessionMins = SQLFieldReader.ReadInt32(ds.Tables(0).Rows(0), Constant.SessionValidation.SessionMins)
+            securityRole = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), Constant.SessionValidation.SecurityRole)
+            sessionGUID = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), Constant.SessionValidation.SessionGUID)
+            userStatus = SQLFieldReader.ReadInt32(ds.Tables(0).Rows(0), Constant.SessionValidation.UserStatus)
+
+            SecurityManager.SessionProfile.SecurityRole = securityRole
+
+            'Check the user status
+            If userStatus = Constant.UserStatus.Active Then
+
+                'Duplicate check
+                If sessionGUID = SecurityManager.SessionProfile.SessionGUID Then
+
+                    'Maximum Session Timed-out check (0 value means no timeout)
+                    If SystemConfiguration.SessionMaxMins = 0 OrElse sessionMins <= SystemConfiguration.SessionMaxMins Then
+
+                        'Session Timed-out check (0 value means no timeout)
+                        If SystemConfiguration.SessionTimeoutMins <> 0 AndAlso lastCallMins > SystemConfiguration.SessionTimeoutMins Then
+                            Logger.Warn("Session has timed out from inactivity")
+
+                            HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.SessionTimeOut
+                            HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: Session Timeout; Request URL: " & Request.Url.AbsolutePath
+                            HttpContext.Current.Items(Constant.ActivityContext.FormID) = Constant.FormID.WUSMsgSessionTimedOut
+                            HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Security
+                            HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpSeverity) = Constant.RequestActionOpSeverity.None
+                            HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+                            LogActivity()
+                            SecurityManager.SignOut(SecurityManager.SessionProfile.UserID, ContextManager.UserSiteContext.LanguageID)
+                            FormUtility.DisplaySignoutMessage(Constant.FormID.WUSMsgSessionTimedOut)
+                        Else
+
+                            ' Determine if the user is a new flex user and if they are take them back to window selection page
+                            Dim isNewFlexUser As Boolean = Service.Security.SecurityManager.IsNewFlexUser(SecurityManager.SessionProfile.UserID)
+                            If isNewFlexUser Then
+                                Logger.Warn("User is only a new flex user - redirect them back to select window screen")
+                                Dim url As String = SystemConfiguration.EquitableHealthRoot & "PlanMember/FlexEnrolments"
+                                HttpContext.Current.Response.Redirect(url, False)
+                            End If
+
+                        End If
+
+                    Else
+                        Logger.Warn("Session has timed out from being active longer than maximum time allowed")
+
+                        HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.SessionTimeOut
+                        HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: Session Timeout; Request URL: " & Request.Url.AbsolutePath
+                        HttpContext.Current.Items(Constant.ActivityContext.FormID) = Constant.FormID.WUSMsgMaxSessionTimedOut
+                        HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Security
+                        HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpSeverity) = Constant.RequestActionOpSeverity.None
+                        HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+                        LogActivity()
+                        SecurityManager.SignOut(SecurityManager.SessionProfile.UserID, ContextManager.UserSiteContext.LanguageID)
+                        FormUtility.DisplaySignoutMessage(Constant.FormID.WUSMsgMaxSessionTimedOut)
+                    End If
+
+                Else
+                    Logger.Warn("Session is invalid because of duplicate logins")
+
+                    HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.MultipleLoginAttempt
+                    HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: Duplicate Session; Request URL: " & Request.Url.AbsolutePath
+                    HttpContext.Current.Items(Constant.ActivityContext.FormID) = Constant.FormID.WUSMsgDuplicateSession
+                    HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Security
+                    HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpSeverity) = Constant.RequestActionOpSeverity.None
+                    HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+                    LogActivity()
+                    SecurityManager.ClearCookies()
+                    SecurityManager.ClearSession()
+                    FormUtility.DisplaySignoutMessage(Constant.FormID.WUSMsgDuplicateSession)
+                End If
+
+            Else
+                Logger.Warn("Session is invalid because account is locked")
+
+                HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.AccountLocked
+                HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: Account Locked; Request URL: " & Request.Url.AbsolutePath
+                HttpContext.Current.Items(Constant.ActivityContext.FormID) = Constant.FormID.WUSMsgAcctNotAvail
+                HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Security
+                HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpSeverity) = Constant.RequestActionOpSeverity.None
+                HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+                LogActivity()
+                SecurityManager.SignOut(SecurityManager.SessionProfile.UserID, ContextManager.UserSiteContext.LanguageID)
+                FormUtility.DisplaySignoutMessage(Constant.FormID.WUSMsgAcctNotAvail)
+            End If
+
+        Else
+            Logger.Warn("Unable to lookup user session - access denied")
+
+            HttpContext.Current.Items(Constant.ActivityContext.RequestType) = Constant.RequestActionType.AccessDenied
+            HttpContext.Current.Items(Constant.ActivityContext.Description) = "Error: Account Denied; Request URL: " & Request.Url.AbsolutePath
+            HttpContext.Current.Items(Constant.ActivityContext.FormID) = Constant.FormID.WUSMsgAccessDenied
+            HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Security
+            HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpSeverity) = Constant.RequestActionOpSeverity.None
+            HttpContext.Current.Items(Constant.ActivityContext.ReqActionOpStatus) = Constant.RequestActionOpStatus.None
+            LogActivity()
+            ExceptionManager.Publish(New Exception(Me.GetType.ToString & " Error: Access denied"))
+            FormUtility.DisplayMessage(Constant.FormID.WUSMsgAccessDenied, False)
+        End If
+
+        Logger.Debug("ValidateSessionGUID finished")
+    End Sub
+
+    'Purpose: Checks if the system is available.
+
+    Function CheckSystemAvailable() As Boolean
+        Dim returnCode As Boolean = True
+
+        'System available check
+        If SystemConfiguration.SystemAvailable Then
+            Dim BatchWindowStartTime As String = SystemConfiguration.BatchWindowStartTime
+            Dim BatchWindowEndTime As String = SystemConfiguration.BatchWindowEndTime
+
+            'Batch window check - equal values mean batch window not implemented
+            If BatchWindowStartTime <> BatchWindowEndTime Then
+                Dim startHour As Int16 = CInt(Split((BatchWindowStartTime), ":")(0))
+                Dim startMinute As Int16 = CInt(Split((BatchWindowStartTime), ":")(1))
+                Dim startTimeInMinutes As Int16 = startHour * 60 + startMinute
+
+                Dim endHour As Int16 = CInt(Split((BatchWindowEndTime), ":")(0))
+                Dim endMinute As Int16 = CInt(Split((BatchWindowEndTime), ":")(1))
+                Dim endTimeInMinutes As Int16 = endHour * 60 + endMinute
+
+                Dim startTime As DateTime
+                Dim endTime As DateTime
+
+                startTime = Date.Today.AddMinutes(startTimeInMinutes)
+
+                If startTimeInMinutes < endTimeInMinutes Then
+                    endTime = Date.Today.AddMinutes(endTimeInMinutes)
+                Else
+                    endTime = Date.Today.AddDays(1).AddMinutes(endTimeInMinutes)
+                End If
+
+                Dim warningPeriod As Int16 = SystemConfiguration.BatchWindowWarningPeriod
+
+                If startTime <= Date.Now AndAlso Date.Now <= endTime Then
+                    returnCode = False
+                ElseIf startTime.AddMinutes(-warningPeriod) <= Date.Now AndAlso Date.Now < startTime Then
+                    Dim cookie As HttpCookie = HttpContext.Current.Request.Cookies("WarningTime")
+
+                    Dim showWarning As Boolean = False
+                    Dim warningInterval As Int16 = SystemConfiguration.BatchWindowWarningInterval
+                    If Not cookie Is Nothing Then
+                        If Date.Now.AddMinutes(-warningInterval) >= cookie.Value Then
+                            cookie.Value = Date.Now
+                            showWarning = True
+                        End If
+                    Else
+                        cookie = New HttpCookie("WarningTime")
+                        cookie.Value = Date.Now
+                        showWarning = True
+                    End If
+
+                    Application.Item("ShowBatchWindowWarning") = showWarning
+                    HttpContext.Current.Items("WarningTime") = cookie
+                    HttpContext.Current.Items("TimeLeft") = startTime.Subtract(Date.Now).Minutes
+                    HttpContext.Current.Items("EndTime") = endTime
+                Else
+                    Application.Item("ShowBatchWindowWarning") = False
+                End If
+            End If
+        Else
+            returnCode = False
+        End If
+
+        Return returnCode
+    End Function
+
+    ' Purpose :
+
+    Sub ShowError()
+        Response.Redirect(String.Format("~/{0}{1}/{2}/Common/Pages/TechnicalDifficulty.htm", Constant.SiteFolderPath.Carrier, SystemConfiguration.ContactUs.CarrierCode, "en"))
+    End Sub
+
+#Region "--- Language and Culture ---"
+
+    ''' <summary>
+    ''' Gets the language from the language chooser, cookie or web.config file (in that order).  Calls GetCultureInfo and returns language code.
+    ''' </summary>
+    ''' <returns>language code</returns>
+    ''' <remarks>Updated 18-Feb-10 LP MAPS 124</remarks>
+    Function SetLanguageSupport() As String
+        Dim language As String = ""
+
+        Try
+            Dim mnemonic As String
+            Dim culture As CultureInfo
+
+            ' Attempt to get the language from the language chooser (only works on click of it)
+            mnemonic = Request.Params(IN3Ctl.LanguageChooser.PostBackEventHiddenControl)
+            language = IN3Biz.Language.GetLanguageCode(mnemonic)
+
+            If Len(language) <= 0 Then
+                ' Attempt to set the language based off the cookie
+                If Not HttpContext.Current.Items(Constant.CookieName.SiteContext) Is Nothing Then
+                    language = ContextManager.UserSiteContext.LanguageCode
+                    ContextManager.UserSiteContext.LanguageID = CacheManager.GetCodeID(Constant.CodeGroup.Language, language, 1)
+                Else
+                    language = SystemConfiguration.DefaultLanguage
+                End If
+            Else
+                ' Take the language from the languageChooser
+                ContextManager.UserSiteContext.LanguageCode = language
+                ContextManager.UserSiteContext.LanguageID = CacheManager.GetCodeID(Constant.CodeGroup.Language, language, ContextManager.UserSiteContext.LanguageID)
+            End If
+
+            culture = GetCultureInfo(language)
+
+            If Not culture Is Nothing Then
+                Thread.CurrentThread.CurrentCulture = culture
+                Thread.CurrentThread.CurrentUICulture = culture
+            End If
+
+        Catch ex As Exception
+            IN3.Frameworks.ExceptionHandling.ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->SetLanguageSupport"), ex)
+        End Try
+
+        Return language
+    End Function
+
+    ''' <summary>
+    ''' Sets the culture code based on the browser setting (if exists) or from the default in web.config. Returns the cultureInfo object.
+    ''' </summary>
+    ''' <param name="code"></param>
+    ''' <returns>cultureInfo object</returns>
+    ''' <remarks>18-Feb-10 LP MAPS 124</remarks>
+    Private Function GetCultureInfo(ByVal code As String) As CultureInfo
+        Dim culture As CultureInfo = Nothing
+
+        Try
+            Dim cultureCode As String = ""
+
+            ' create specific culture from the browser language setting
+            If Not Request.UserLanguages Is Nothing Then
+                For Each lang As String In Request.UserLanguages
+                    ' 19-Jan-10 LP MAPS 124; For some reason extra characters are appended on the last browser language if multiple are selected
+                    ' If they are detected, only take the first 5 (i.e. en-CA)
+                    If lang.Length > 5 Then
+                        lang = lang.Substring(0, 5)
+                    End If
+
+                    ' If the browser language (lang) starts with the languageCode parameter, set cultureCode equal to lang and exit the loop
+                    If lang.StartsWith(code) Then
+                        cultureCode = lang
+                        Exit For
+                    End If
+                Next
+            End If
+
+            ' If culture code could not be retrieved from
+            If cultureCode = "" Then
+                Select Case code
+                    Case Constant.LanguageCodes.French
+                        cultureCode = SystemConfiguration.DefaultFrenchCulture
+                    Case Else
+                        cultureCode = SystemConfiguration.DefaultEnglishCulture
+                End Select
+            End If
+
+            culture = CreateCulture(cultureCode)
+
+            ' 19-Jan-10 LP MAPS 124 - functionality doesn't work. Remove for now...
+            'ApplyCultureOverrides(code, culture)
+
+        Catch ex As Exception
+            IN3.Frameworks.ExceptionHandling.ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->GetCultureInfo"), ex)
+        End Try
+
+        Return culture
+    End Function
+
+    ''' <summary>
+    ''' Designed to handle the XML culture overrides files, by overriding specific formatting properties.  Not working as of 18-Feb-10.
+    ''' </summary>
+    ''' <param name="code"></param>
+    ''' <param name="culture"></param>
+    ''' <remarks>18-Feb-10 LP MAPS 124</remarks>
+    Private Sub ApplyCultureOverrides(ByVal code As String, ByRef culture As CultureInfo)
+        Try
+            Dim row As DataRow = Nothing
+            Dim dt As DataTable
+            Dim dType As System.Type
+            Dim nType As System.Type
+            Dim name As String
+            Dim propInfo As System.Reflection.PropertyInfo
+            Dim rowValue As String
+            Dim fileName As String
+
+            ' get culture info override settings
+            fileName = Server.MapPath(String.Concat("~/", _
+                     Constant.SiteFolderPath.Carrier, _
+                     SystemConfiguration.ContactUs.CarrierCode, Constant.UrlSeparator, _
+                     code, Constant.UrlSeparator, _
+                     "Common/", _
+                     Constant.CarrierResourceFolderPath.XML, _
+                     "CultureInfo.xml"))
+
+            dt = CacheManager.GetCultureInfo(code, fileName)
+
+            ' if browser did not provide specific culture use the culture info culture code override
+            If SQLFieldReader.GetDataRow(dt, 0, row) Then
+                If culture Is Nothing Then
+                    culture = CreateCulture(SQLFieldReader.ReadString(row, "CultureCode"))
+                End If
+            End If
+
+            ' if browser and culture info override did not provide specific culture, create neutral culture
+            If culture Is Nothing Then
+                culture = CreateCulture(code)
+            End If
+
+            ' apply other culture info overrides
+            If Not row Is Nothing Then
+                dType = GetType(DateTimeFormatInfo)
+                nType = GetType(NumberFormatInfo)
+
+                For Each col As DataColumn In row.Table.Columns
+                    name = col.ColumnName
+                    rowValue = SQLFieldReader.ReadString(row, name)
+
+                    If Len(rowValue) > 0 Then
+                        propInfo = dType.GetProperty(name)
+
+                        If propInfo Is Nothing Then
+                            propInfo = nType.GetProperty(name)
+
+                            If Not propInfo Is Nothing Then
+                                SetCultureProperty(propInfo, culture.NumberFormat, rowValue)
+                            End If
+                        Else
+                            ' date format properties are all string type
+                            propInfo.SetValue(culture.DateTimeFormat, rowValue, Nothing)
+                        End If
+                    End If
+                Next
+            End If
+        Catch ex As Exception
+            IN3.Frameworks.ExceptionHandling.ExceptionManager.ThrowException(String.Concat(Me.GetType.ToString, "->ApplyCultureOverrides"), ex)
+        End Try
+    End Sub
+
+    ' Purpose : 
+
+    Private Sub SetCultureProperty( _
+                ByVal propInfo As System.Reflection.PropertyInfo, _
+                ByVal numInfo As NumberFormatInfo, _
+                ByVal value As String _
+                )
+
+        Dim strList() As String
+        Dim intList As New ArrayList
+
+        If propInfo.PropertyType Is GetType(Int32) Then
+            propInfo.SetValue(numInfo, CInt(value), Nothing)
+
+        ElseIf propInfo.PropertyType Is GetType(Int32()) Then
+            strList = Split(value, ",")
+
+            For Each s As String In strList
+                If IsNumeric(s) Then
+                    intList.Add(CInt(s))
+                End If
+            Next
+
+            If intList.Count > 0 Then
+                propInfo.SetValue(numInfo, intList.ToArray(GetType(Int32)), Nothing)
+            End If
+        Else
+            propInfo.SetValue(numInfo, value, Nothing)
+        End If
+    End Sub
+
+    ' Purpose :
+
+    Private Function CreateCulture(ByVal code As String) As CultureInfo
+        Dim culture As CultureInfo = Nothing
+
+        If Len(code) > 0 Then
+            Try
+                culture = CultureInfo.CreateSpecificCulture(code)
+            Catch ex As Exception
+            End Try
+        End If
+
+        Return culture
+    End Function
+
+#End Region
+
+#End Region
+End Class
+
+
+================
+ '-----------------------------------------------------------------------------------------------
+'FILE: Service.Security.vb
+'
+'-----------------------------------------------------------------------------------------------
+'COPYRIGHT NOTIFICATION
+'
+'These materials (including without limitation all articles, text, images, logos, software, code 
+'and design) are copyright © 1996-2006 to The Equitable Life Insurance Company of Canada. 
+'All rights reserved. 
+'These materials may not otherwise be copied, transferred, redistributed, rewritten, reproduced in 
+'whole or in part, for commercial or noncommercial purposes or for compensation of any kind, in any 
+'form or medium, without the express written permission of The Equitable Life Insurance Company of 
+'Canada.
+'Any use of these materials is expressly prohibited by law, and may result in severe civil and criminal 
+'penalties. Violators will be prosecuted to the maximum extent possible.
+'
+'If you have questions about these terms, or would like information about licensing materials from 
+'The Equitable Life Insurance Company of Canada, please send an e-mail to legal@equitable.ca.
+'
+'	Equitable Life of Canada
+'	One Westmount Road North
+'	Waterloo,Ontario
+'	Canada, N2J 4C7
+'
+'-----------------------------------------------------------------------------------------------
+'Author:        Ed Virola
+'Creation Date: 03/23/2004
+'
+'Purpose:       Contains several classes that deal with security - authentication,
+'               retrieving user role & status, encryption, etc.
+'
+'-----------------------------------------------------------------------------------------------
+'Updates:       1-Feb-10 LP MAPS 124 Added browserLanguageID param to GetUserProfileSession and 
+'                                   and BookmarkLanguageID param in CreateExternalSession
+'-----------------------------------------------------------------------------------------------
+Imports System.IO
+Imports System.Text
+Imports System.Web
+Imports System.Web.Security
+Imports System.Security.Cryptography
+Imports IN3.BMSWeb.Common
+Imports IN3.BMSWeb.Service.Context
+Imports IN3.Frameworks.Security
+Imports IN3.Frameworks.Telemetry
+Imports IN3.Frameworks.ExceptionHandling
+Imports CAPICOM
+
+Namespace Service.Security
+
+    ' Class   : SecurityManager
+    ' Purpose : Class that encapsulates helper methods which enable developers
+    '           to check the user role and status.
+    ' History : Edv	02/24/2004	Original creation
+    '           at    2008-12-22  maps#468 concierge - added AuthenticateExternal and CreateExternalSession
+
+    Public NotInheritable Class SecurityManager
+
+#Region "--- BMS Web Security Methods ---"
+
+        Private Const ClassName As String = "SecurityManager"
+        Private Shared EncryptionKey As Array
+        Private Shared InitialVector As Array
+
+        Shared Sub New()
+            EncryptionKey = Array.CreateInstance(GetType(Byte()), 5)
+            EncryptionKey(Cryptography.EncryptionType.None) = Nothing
+            EncryptionKey(Cryptography.EncryptionType.DES) = New Byte() {16, 15, 191, 78, 227, 170, 199, 46}
+            EncryptionKey(Cryptography.EncryptionType.RC2) = New Byte() {25, 41, 155, 106, 136, 170, 140, 182, 206, 235, 59, 86, 163, 184, 181, 56}
+            EncryptionKey(Cryptography.EncryptionType.TripleDES) = New Byte() {118, 14, 231, 58, 248, 195, 176, 203, 249, 222, 121, 218, 242, 85, 195, 95, 118, 217, 74, 147, 230, 21, 81, 167}
+            EncryptionKey(Cryptography.EncryptionType.RijnDael) = New Byte() {180, 74, 151, 209, 142, 216, 171, 8, 219, 34, 214, 27, 119, 165, 152, 98, 136, 69, 194, 99, 242, 251, 38, 84, 52, 9, 219, 24, 183, 233, 250, 10}
+
+            InitialVector = Array.CreateInstance(GetType(Byte()), 5)
+            InitialVector(Cryptography.EncryptionType.None) = Nothing
+            InitialVector(Cryptography.EncryptionType.DES) = New Byte() {91, 253, 57, 41, 163, 90, 113, 93}
+            InitialVector(Cryptography.EncryptionType.RC2) = New Byte() {135, 157, 174, 32, 50, 114, 116, 21}
+            InitialVector(Cryptography.EncryptionType.TripleDES) = New Byte() {146, 122, 31, 78, 201, 27, 217, 68}
+            InitialVector(Cryptography.EncryptionType.RijnDael) = New Byte() {189, 210, 44, 231, 34, 105, 101, 130, 27, 52, 87, 115, 220, 87, 237, 120}
+        End Sub
+
+        Public Shared Function GetGuestAccount() As String
+            Return Decrypt(SystemConfiguration.GuestAccount)
+        End Function
+
+        ' Purpose : Returns a string containing the profile and roles for a specific user.
+
+        Private Shared Sub GetProfileRoles(
+                 ByVal uid As String,
+                 ByRef profile As String,
+                 ByRef roles As String)
+
+            'Note: Pass sysproxy as the process user and username as the UID_userID until ROCRole is implemented
+            Dim ds As DataSet = SecurityDB.GetProfileRoles(GetGuestAccount(), 1, uid)
+
+            'Build profile string
+            Dim profileRow As DataRow = ds.Tables(0).Rows(0)
+            Dim userProfile(5) As String
+
+            'ROCID should not be saved in cookies.
+            userProfile(Constant.UserProfile.SessionGUID) = SQLFieldReader.ReadString(profileRow, "SessionGUID")
+            userProfile(Constant.UserProfile.UserID) = SQLFieldReader.ReadString(profileRow, "UserID").Trim()
+            userProfile(Constant.UserProfile.ContactName) = SQLFieldReader.ReadString(profileRow, "ContactName")
+
+            If Not IsDBNull(profileRow("LastWebCallDtTmGMT")) Then
+                userProfile(Constant.UserProfile.LastLogonDate) = CDate(profileRow("LastWebCallDtTmGMT")).ToString(Constant.DataFormat.DateTimeFormat)
+            End If
+
+            'Security role should not be saved in cookies. It is retrieved from the db on each request.
+            userProfile(Constant.UserProfile.SecurityRole) = ""
+
+            profile = String.Join(";", userProfile)
+
+            'Build roles string 
+            Dim row As DataRow
+            Dim userRoles As New StringBuilder
+
+            For Each row In ds.Tables(1).Rows
+                userRoles.Append(row("ModuleCode"))
+                userRoles.Append(";")
+            Next
+
+            If userRoles.Length > 0 Then
+                userRoles.Remove(userRoles.Length - 1, 1)
+            End If
+
+            roles = userRoles.ToString
+        End Sub
+
+        ' Purpose : Returns a boolean which indicates whether the current user is in the specified role
+
+        Public Shared Function IsInRole(ByVal role As String) As Boolean
+            If TypeOf HttpContext.Current.User Is BMSWebPrincipal Then
+                Dim principal As BMSWebPrincipal = HttpContext.Current.User
+
+                Return principal.IsInRole(role)
+            Else
+                Return False
+            End If
+        End Function
+
+        ' Purpose : Returns a boolean which indicates whether the current user is in any of the specified roles
+
+        Public Shared Function IsInAnyRole(ByVal roles As String) As Boolean
+            If TypeOf HttpContext.Current.User Is BMSWebPrincipal Then
+                Dim principal As BMSWebPrincipal = HttpContext.Current.User
+
+                Return principal.IsInAnyRole(Split(roles, "|"))
+            Else
+                Return False
+            End If
+        End Function
+
+        ' Purpose : Returns a boolean which indicates whether the current user is in all of the specified roles
+
+        Public Shared Function IsInAllRoles(ByVal roles As String) As Boolean
+            If TypeOf HttpContext.Current.User Is BMSWebPrincipal Then
+                Dim principal As BMSWebPrincipal = HttpContext.Current.User
+
+                Return principal.IsInAllRoles(Split(roles, "|"))
+            Else
+                Return False
+            End If
+        End Function
+
+        Public Shared Function IsNewFlexUser(ByVal userName As String) As Boolean
+            Dim ds As DataSet = SecurityDB.GetUserCredentials(GetGuestAccount(), 1, userName)
+            Dim row = ds.Tables(0).Rows(0)
+
+            Return SQLFieldReader.ReadBoolean(row, "HASONLYNEWFLEX")
+        End Function
+
+        ' Purpose : Returns a string which specifies the user profile
+
+        Public Shared ReadOnly Property SessionProfile() As BMSWebPrincipal.SessionProfile
+            Get
+                If TypeOf HttpContext.Current.User Is BMSWebPrincipal Then
+                    Dim principal As BMSWebPrincipal = HttpContext.Current.User
+
+                    Return principal.Profile
+                Else
+                    Return Nothing
+                End If
+            End Get
+        End Property
+
+        ' Purpose : Attaches the principal to the context
+
+        Public Shared Function AttachPrincipal(ByVal authCookie As HttpCookie) As Boolean
+            Dim authTicket As FormsAuthenticationTicket = Nothing
+
+            Try
+                If Not authCookie Is Nothing Then
+                    authTicket = FormsAuthentication.Decrypt(authCookie.Value)
+                End If
+
+                'make sure auth cookie has a valid value
+                If IsNothing(authTicket) Or authTicket.Expired Then
+                    Return False
+                End If
+
+                'userData stored in the ticket is a pipe delimited string containing roles and profile
+                Dim userData() As String = Split(authTicket.UserData, "|")
+
+                'user roles is stored as semicolon delimited string
+                Dim roles() As String = Split(userData(Constant.UserData.UserRoles), ";")
+
+                'user profile is stored as semicolon delimited string. pass it to the UserProfile constructor
+                Dim userProfile As New BMSWebPrincipal.SessionProfile(userData(Constant.UserData.UserProfile))
+
+                Dim request = HttpContext.Current.Request
+
+                'Extracting the TrueClientIP value attached to the cookie
+                Dim TrueClientIP As String = userData(Constant.UserData.TrueClientIP)
+
+                'Fetching the client IP from the Server variables
+
+                Dim ipAddress As String = "None"
+
+                'Assigning value of TrueclientIP from the request header if it is present. it will only be present when code travels through akamai WAF
+                If (request.Headers("True-Client-IP") <> Nothing) Then
+                    ipAddress = request.Headers("True-Client-IP")
+                End If
+
+                'Comparing the TrueClientIP on request to the one on cookie
+                If (ipAddress <> TrueClientIP) Then
+
+                    EventLogger.WriteEntry("True Client IP in request is " + ipAddress, EventLogEntryType.Information)
+                    EventLogger.WriteEntry("True Client IP in cookie is " + TrueClientIP, EventLogEntryType.Information)
+
+                    Return False
+
+                End If
+
+                Dim id As New FormsIdentity(authTicket)
+
+                'create a custom principal and store it in the user context object
+                Dim principal As New BMSWebPrincipal(id, roles, userProfile)
+
+                HttpContext.Current.User = principal
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".AttachPrincipal", ex)
+            End Try
+
+            Return True
+        End Function
+
+        ' Purpose : Returns a boolean which indicates whether the current user is authenticated
+
+        Public Shared Function IsAuthenticated() As Boolean
+            Dim authCookie As HttpCookie = HttpContext.Current.Request.Cookies(FormsAuthentication.FormsCookieName)
+
+            If authCookie Is Nothing Then
+                Return False
+            End If
+
+            Return True
+        End Function
+
+        ' Purpose : Returns a boolean which indicates whether the current user is authenticated by the security engine
+
+        Public Shared Sub SecEngineAuthenticate()
+            Dim secEngineURL As String = "www.secengine.com?returnURL=http://www.bmsweb.com/verifyGUID.aspx"
+            HttpContext.Current.Response.Redirect(secEngineURL)
+        End Sub
+
+        ' Purpose :
+
+        Friend Shared Function GetWindowsUser(ByVal key As String) As WindowsUser
+            Dim text As String
+            Dim user() As String
+            Dim winUser As WindowsUser = Nothing
+
+            text = SystemConfiguration.GetString(key)
+
+            If Len(text) > 0 Then
+                user = Split(Decrypt(text), "\", 3)
+                winUser = New WindowsUser(user(1), user(2), user(0))
+            End If
+
+            Return winUser
+        End Function
+
+        ' Purpose : 
+
+        Public Shared Function Encrypt(ByVal text As String) As String
+            Dim type As Cryptography.EncryptionType
+
+            type = GetEncryptionType()
+            Return Cryptography.Encrypt(text, type, EncryptionKey(type), InitialVector(type))
+        End Function
+
+        ' Purpose :
+
+        Public Shared Function Decrypt(ByVal text As String) As String
+            Dim type As Cryptography.EncryptionType
+
+            type = GetEncryptionType()
+            Return Cryptography.Decrypt(text, type, EncryptionKey(type), InitialVector(type))
+        End Function
+
+        ' Purpose :
+
+        Private Shared Function GetEncryptionType() As Cryptography.EncryptionType
+            Dim value As String
+            Dim type As Cryptography.EncryptionType
+
+            value = SystemConfiguration.EncryptionType
+
+            If Len(value) > 0 Then
+                type = [Enum].Parse(GetType(Cryptography.EncryptionType), value, True)
+            Else
+                type = Cryptography.EncryptionType.RijnDael
+            End If
+
+            Return type
+        End Function
+
+        Public Shared Function UpdateUserIdAndRoles(ByVal userId As String, ByVal policyId As Int16, ByVal moduleCode As String) As DataSet
+            Try
+                Return SecurityDB.UpdateUserIdAndRoles(userId, policyId, moduleCode)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".UpdateUserCredentials", ex)
+            End Try
+        End Function
+
+#End Region
+
+#Region "--- Authentication Engine Methods ---"
+
+        ' Purpose : Authenticates the user 
+
+        Public Shared Function Authenticate(
+                 ByVal userName As String,
+                 ByVal password As String,
+                 ByRef UID As String
+                 ) As String
+
+            If SystemConfiguration.EventLogging Then
+                EventLogger.WriteEntry("Security.Authenticate", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+            End If
+
+            Dim returnCode As String = ""
+
+            Try
+                If SystemConfiguration.EventLogging Then
+                    EventLogger.WriteEntry("Security.Authenticate->SecurityDB.GetUserCredentials", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+                End If
+
+                Dim ds As DataSet = SecurityDB.GetUserCredentials(GetGuestAccount(), 1, userName)
+
+                If (Not ds Is Nothing) AndAlso (ds.Tables(0).Rows.Count > 0) Then
+                    Dim credentials As New UserCredentials(ds, True)
+
+                    If SystemConfiguration.EventLogging Then
+                        EventLogger.WriteEntry("Security.Authenticate->Check Active Status", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+                    End If
+
+                    If credentials.Status = Constant.UserStatus.Active Then
+
+                        If SystemConfiguration.EventLogging Then
+                            EventLogger.WriteEntry("Security.Authenticate->credentials.IsLockedOut", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+                        End If
+
+                        If Not credentials.IsLockedOut Then
+
+                            If SystemConfiguration.EventLogging Then
+                                EventLogger.WriteEntry("Security.Authenticate->credentials.IsPasswordExpired", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+                            End If
+
+                            If Not credentials.IsPasswordExpired Then
+                                Dim hashedPassword As String = CreatePasswordHash(password, credentials.HashSaltValue)
+
+                                UID = credentials.UID
+                                If SystemConfiguration.EventLogging Then
+                                    EventLogger.WriteEntry("Security.Authenticate->Check hashedPassword ", Diagnostics.EventLogEntryType.Information, SystemConfiguration.ProductName)
+                                End If
+
+                                If (hashedPassword = credentials.HashedPassword) Then
+                                    'Valid user, now reset the login failed count and last logon date: 0 means successful
+                                    UpdateUserCredentials(UID, 0, Date.Now)
+                                    Return returnCode
+
+                                Else
+                                    If credentials.LogonFailCount >= SystemConfiguration.LoginLockOutCount Then
+                                        'Raise error W0104
+                                        returnCode = Constant.MessageCode.AccountLockedOut
+
+                                        'reset login fail count and lock the user out: -1 means lockout
+                                        Dim LockOutDateTime As Date = credentials.SystemDateTime.AddMinutes(SystemConfiguration.LoginLockOutDurationMins)
+
+                                        UpdateUserCredentials(UID, -1, LockOutDateTime)
+
+                                    Else
+                                        'Raise error W0015
+                                        returnCode = Constant.MessageCode.InvalidPassword
+
+                                        'increment the login fail count
+                                        UpdateUserCredentials(UID, credentials.LogonFailCount + 1, Date.Now)
+
+                                    End If
+                                End If
+                            Else
+                                'Password expired - raise error
+                                returnCode = Constant.MessageCode.PasswordExpired
+                            End If
+                        Else
+                            'Account locked out - raise error W0104
+                            returnCode = Constant.MessageCode.AccountLockedOut
+                        End If
+                    Else
+                        'the account is not active, display wether account is inactive or not available
+                        If credentials.Status = Constant.UserStatus.NewStatus Then
+                            'Account not active - raise error W0010
+                            returnCode = Constant.MessageCode.AccountNotActivated
+                        Else
+                            'Account not available - raise error 1023011
+                            returnCode = Constant.MessageCode.AccountNotAvailable
+                        End If
+                    End If
+                Else
+                    'No record - raise error W0013
+                    returnCode = Constant.MessageCode.InvalidCredentials
+                End If
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".Authenticate", ex)
+
+            End Try
+
+            Return returnCode
+        End Function
+
+        ' Purpose : Authenticates credentials for external (service provider) session. Originally
+        '           uses the primary authentication logic
+
+        Public Shared Function AuthenticateExternal(
+                 ByVal userName As String,
+                 ByVal password As String,
+                 ByRef profile As ExternalSessionProfile
+                 ) As String
+
+            Dim errorCode As String = String.Empty
+            Dim uid As String = String.Empty
+
+            errorCode = Authenticate(userName, password, uid)
+
+            If errorCode.Length <= 0 AndAlso uid.Length > 0 Then
+                profile = ExternalSessionProfile.Create(uid)
+            End If
+
+            Return errorCode
+        End Function
+
+        ''' <summary>
+        ''' Creates an external (service provider) session and returns the new session id
+        ''' </summary>
+        ''' <param name="provider"></param>
+        ''' <param name="profile"></param>
+        ''' <param name="formID"></param>
+        ''' <returns></returns>
+        ''' <remarks>1-Feb-10 LP MAPS 124 - Added BookmarkLanguageID to data table to send to web service</remarks>
+        Public Shared Function CreateExternalSession(
+                    ByVal provider As SystemConfiguration.ServiceProvider.ServiceProvider,
+                    ByVal profile As ExternalSessionProfile,
+                    ByVal formID As Int32) As String
+
+            Dim result As ServiceProviderWS.StringResult = Nothing
+            Dim ws As ServiceProviderWS.Concierge = Nothing
+            Dim ds As New DataSet
+
+            Try
+                If provider Is Nothing Then
+                    Throw New ArgumentNullException("provider")
+                End If
+
+                ' build and populate parameter dataset
+                With ds.Tables.Add("ServiceProvider")
+                    .Columns.Add("PROVIDERID", GetType(String))
+                    .Columns.Add("CLIENTIP", GetType(String))
+                    .Columns.Add("BOOKMARKURL", GetType(String))
+                    ' add bookmark languageID column to data table
+                    .Columns.Add("BOOKMARKLANGUAGEID", GetType(Int16))
+
+                    ' add bookmark languageID 
+                    .Rows.Add(New Object() {provider.ID, HttpContext.Current.Request.UserHostAddress, provider.BookmarkUrl, provider.BookmarkLanguageID})
+                End With
+
+                ' instantiate webservice object
+                ws = SecuredResources.SecuredResourcesManager.CreateServiceProviderWebService()
+
+                ' build authentication header
+                With ws.AuthHeaderValue
+                    ' replace default user id otherwise, users who just logged in through
+                    ' the secondary sign in page will get sysproxy information
+                    .UserID = profile.UserID
+
+                    .LanguageID = ContextManager.UserSiteContext.LanguageID
+                    .ModuleCode = Constant.ModuleCode.AuthenticationEngine
+                    .FormID = formID
+                End With
+
+                ' call webservice
+                result = ws.CreateSession(ds)
+
+            Catch ex As Exception
+                ExceptionManager.ThrowException("SecurityManager.CreateExternalSession", ex)
+            End Try
+
+            Return result.Value
+        End Function
+
+        ' Purpose : Updates user info after successful or unsuccessful login
+
+        Private Shared Sub UpdateUserCredentials(
+                    ByVal UID As String,
+                    ByVal loginFailCount As Short,
+                    ByVal lockOutDateTime As Date)
+
+            Dim IsLoginSuccessful As Boolean = (loginFailCount = 0)
+
+            Try
+                With HttpContext.Current
+                    Dim cookiesEnabled As String = IIf(.Request.Browser.Cookies, "1", "0")
+                    SecurityDB.UpdateUserCredentials(
+                             GetGuestAccount(),
+                             1,
+                             UID,
+                             loginFailCount,
+                             lockOutDateTime,
+                             IIf(IsLoginSuccessful, .Server.HtmlEncode(.Request.UserHostAddress), ""),
+                             IIf(IsLoginSuccessful, .Server.HtmlEncode(.Request.Browser.Type), ""),
+                             IIf(IsLoginSuccessful, .Server.HtmlEncode(.Request.Browser.Version), ""),
+                             IIf(IsLoginSuccessful, .Server.HtmlEncode(.Request.UserHostName), ""),
+                             IIf(IsLoginSuccessful, cookiesEnabled, "1"),
+                             IIf(IsLoginSuccessful, .Server.HtmlEncode(.Request.Browser.Platform), ""))
+                End With
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".UpdateUserCredentials", ex)
+
+            End Try
+
+        End Sub
+
+        ''' <summary>
+        ''' Gets the user session information from S00UserProfile
+        ''' </summary>
+        ''' <param name="processUserID"></param>
+        ''' <param name="language"></param>
+        ''' <param name="userID"></param>
+        ''' <param name="sessionGUID"></param>
+        ''' <param name="browserLanguageID"></param>
+        ''' <returns></returns>
+        ''' <remarks>18-Feb-10 LP MAPS 124 - Added browserLanguageID param in method definition and in call to SecurityDB</remarks>
+        Public Shared Function GetUserProfileSession(
+                ByVal processUserID As String,
+                ByVal language As Int16,
+                ByVal userID As String,
+                ByVal sessionGUID As String,
+                ByVal browserLanguageID As Int16
+                ) As DataSet
+
+            Dim ds As DataSet
+
+            Try
+                ' Added browserLanguageID param
+                ds = SecurityDB.GetUserProfileSession(
+                      processUserID,
+                      language,
+                      userID,
+                      sessionGUID,
+                      browserLanguageID)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".GetUserProfile", ex)
+
+            End Try
+
+            Return ds
+        End Function
+
+        ' Purpose : Retrieves the user profile.
+
+        Public Shared Function GetUserProfile(ByVal userID As String, ByVal language As Int16) As DataSet
+            Dim ds As DataSet
+
+            Try
+                ds = SecurityDB.GetUserProfile(
+                      userID,
+                      language)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".GetUserProfile", ex)
+
+            End Try
+
+            Return ds
+        End Function
+
+        ' Purpose : Updates user profile.
+
+        Public Shared Function UpdateUserProfile(
+                 ByVal userName As String,
+                 ByVal password As String,
+                 ByVal checkPasswordCount As Int16,
+                 ByVal forcePasswordChange As Char,
+                 ByVal challengeQuestion As String,
+                 ByVal challengeResponse As String,
+                 ByVal email As String
+                 ) As StringResult
+
+            Dim strResult As StringResult
+            Dim ds As DataSet
+            Dim row As DataRow = Nothing
+            Dim salt As String
+            Dim hashedPassword As String = ""
+
+            Try
+                If password.Length > 0 Then
+                    ds = SecurityManager.GetUserProfile(userName, ContextManager.UserSiteContext.LanguageID)
+
+                    If SQLFieldReader.GetDataRow(ds, 0, 0, row) Then
+                        salt = SQLFieldReader.ReadString(row, Constant.UserCredentials.HashSaltValue)
+                        hashedPassword = SecurityManager.CreatePasswordHash(password, salt)
+                    Else
+                        strResult = New StringResult("", 1, Constant.MessageCode.InvalidCredentials, "SecurityManager.UpdateUserProfile")
+
+                        Exit Try
+                    End If
+                End If
+
+                strResult = SecurityDB.UpdateUserProfile(
+                               userName,
+                               ContextManager.UserSiteContext.LanguageID,
+                               hashedPassword,
+                               checkPasswordCount,
+                               forcePasswordChange,
+                               challengeQuestion,
+                               challengeResponse,
+                               email)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".UpdateUserProfile", ex)
+
+            End Try
+
+            Return strResult
+        End Function
+
+        ' Purpose : Verifies user information. Called during planadmin/producer activation process.
+        ' History : at 2006-10-11  cr#1272 - self registration implementation - replaced original with two overloaded methods
+
+        Public Shared Function VerifyIdentity(ByVal userName As String, ByVal password As String) As String
+            Dim returnCode As String
+            Dim credentials As UserCredentials
+            Dim isValidUserName As Boolean
+            Dim isValidPassword As Boolean
+            Dim ds As DataSet
+
+            Try
+                ' verify username. do not include name, birthdate, policy, certificate
+                ds = SecurityDB.GetUserIdentity(
+                      GetGuestAccount(), 1,
+                      userName,
+                      String.Empty, String.Empty, Date.MinValue, String.Empty, String.Empty,
+                      isValidUserName, False, False, False, False)
+
+                If SQLFieldReader.IsEmpty(ds, 0) Then
+                    ' no record. user does not exist or invalid password
+                    returnCode = Constant.MessageCode.InvalidCredentials
+                    Exit Try
+                End If
+
+                ' create credential object
+                credentials = New UserCredentials(ds, False)
+
+                ' validated password. HashedPassword is clear text if not yet activated
+                isValidPassword = password = credentials.HashedPassword
+
+                ' validate credential
+                returnCode = ValidateCredentials(credentials,
+                         isValidUserName AndAlso isValidPassword,
+                         Constant.MessageCode.InvalidCredentials)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".VerifyIdentity", ex)
+            End Try
+
+            Return returnCode
+        End Function
+
+        ' Purpose : Verifies user information. Called during planmember activation process.
+        ' History : at 2006-10-11  cr#1272 - self registration implementation - replaced original with two overloaded methods
+
+        Public Shared Function VerifyIdentity(
+                    ByVal firstName As String,
+                    ByVal lastName As String,
+                    ByVal birthDate As Date,
+                    ByVal policyCode As String,
+                    ByVal certNum As String,
+                    ByRef userID As String
+                    ) As String
+
+            Dim returnCode As String
+            Dim credentials As UserCredentials
+            Dim isValidInput As Boolean
+            Dim isValidPersonName As Boolean
+            Dim isValidBirthDate As Boolean
+            Dim isValidPolicyCode As Boolean
+            Dim isValidCertNum As Boolean
+            Dim ds As DataSet
+            Dim dt As DataTable = Nothing
+            Dim rows() As DataRow = Nothing
+
+            Try
+                ' verify name, birthdate, policy, certificate. do not include username
+                ds = SecurityDB.GetUserIdentity(
+                      GetGuestAccount(), 1,
+                      String.Empty,
+                      firstName, lastName, birthDate, policyCode, certNum,
+                      False, isValidPersonName, isValidBirthDate, isValidPolicyCode, isValidCertNum)
+
+                ' summarize validation flags
+                isValidInput = isValidPersonName AndAlso isValidBirthDate AndAlso isValidPolicyCode AndAlso isValidCertNum
+
+                If Not SQLFieldReader.GetDataTable(ds, 0, dt) Then
+                    ' sp did not return a recordset
+                    ' user profile may not have been created yet (if user information is valid)
+                    ' or user information is invalid
+
+                    If isValidInput Then
+                        returnCode = Constant.MessageCode.UserProfileDoesNotExist
+                        Exit Try
+                    Else
+                        returnCode = Constant.MessageCode.InsufficientData
+                        Exit Try
+                    End If
+                End If
+
+                If SQLFieldReader.GetDataRows(dt, Constant.UserCredentials.Status & "=" & Constant.UserStatus.Active.ToString("d"), "", rows) Then
+                    ' one or more accounts are already active
+                    ' if a new account exists, it should not be activated. the user should use the already active account
+
+                    If SQLFieldReader.GetDataRows(dt, Constant.UserCredentials.Status & "=" & Constant.UserStatus.NewStatus.ToString("d"), "", rows) Then
+                        returnCode = Constant.MessageCode.MultipleActiveAccounts
+                        Exit Try
+                    Else
+                        returnCode = Constant.MessageCode.AccountAlreadyActive
+                        Exit Try
+                    End If
+                Else
+                    ' no account is active. process only if only one new account exist
+
+                    ' check for existence of a new account
+                    If Not SQLFieldReader.GetDataRows(dt, Constant.UserCredentials.Status & "=" & Constant.UserStatus.NewStatus.ToString("d"), "", rows) Then
+                        returnCode = Constant.MessageCode.AccountNotAvailable
+                        Exit Try
+                    End If
+
+                    ' check for multiple new accounts
+                    If rows.Length > 1 Then
+                        returnCode = Constant.MessageCode.MultipleUsersRegistered
+                        Exit Try
+                    End If
+
+                    ' at this point we can assume no active account and only one new account exists
+                    credentials = New UserCredentials(rows(0), False)
+                End If
+
+                ' return userid
+                userID = credentials.UserID
+
+                ' validate credential
+                returnCode = ValidateCredentials(credentials, isValidInput, Constant.MessageCode.InsufficientData)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".VerifyIdentity", ex)
+            End Try
+
+            Return returnCode
+        End Function
+
+        ' Purpose : Validates credential object 
+        ' History : at 2006-10-11  cr#1272 - self registration implementation
+
+        Private Shared Function ValidateCredentials(
+                    ByVal credentials As UserCredentials,
+                    ByVal isValidInput As Boolean,
+                    ByVal inputErrorCode As String
+                    ) As String
+
+            ' check if account is already active
+            If credentials.Status = Constant.UserStatus.Active Then
+                Return Constant.MessageCode.AccountAlreadyActive
+            End If
+
+            ' check if account is locked out
+            If credentials.IsLockedOut Then
+                Return Constant.MessageCode.AccountLockedOut
+            End If
+
+            ' activate only if account status is New
+            If credentials.Status <> Constant.UserStatus.NewStatus Then
+                'decided to use account not available form
+                Return Constant.MessageCode.AccountNotAvailable
+            End If
+
+            ' check if values provided are valid
+            If isValidInput Then
+                ' success. reset logon fail count and return no error code
+                UpdateUserCredentials(credentials.UserID, 0, Date.Now)
+                Return String.Empty
+
+            ElseIf credentials.LogonFailCount >= SystemConfiguration.ActivationLockOutCount - 1 Then
+                ' logon fail count exceeds maximum. reset logon fail count and lock the user out (-1 means lockout)
+                UpdateUserCredentials(credentials.UserID, -1, credentials.SystemDateTime.AddMinutes(SystemConfiguration.ActivationLockOutDurationMins))
+                Return Constant.MessageCode.AccountLockedOut
+
+            Else
+                ' activation / logon failed. increment fail count
+                UpdateUserCredentials(credentials.UserID, credentials.LogonFailCount + 1, Date.Now)
+                Return inputErrorCode
+            End If
+        End Function
+
+        ' Purpose : Signs the user out and clears the session GUID. 
+
+        Public Overloads Shared Sub SignOut(ByVal userID As String, ByVal language As Int16)
+            ClearCookies()
+            ClearSession()
+        End Sub
+
+        ' Purpose : Clears cookies
+
+        Public Shared Sub ClearCookies()
+            HttpContext.Current.Response.Cookies(FormsAuthentication.FormsCookieName).Expires = Today.AddDays(-1)
+            HttpContext.Current.Response.Cookies(Constant.CookieName.SiteContext).Expires = Today.AddDays(-1)
+            HttpContext.Current.Response.Cookies(Constant.CookieName.TimeoutIndicator).Expires = Today.AddDays(-1)
+        End Sub
+
+        ' Purpose : Clears session states
+
+        Public Shared Sub ClearSession()
+            If Not IsNothing(HttpContext.Current.Session) Then
+                HttpContext.Current.Session.Clear()
+            End If
+        End Sub
+
+        ' Purpose : Creates a hashed password
+
+        Public Shared Function CreatePasswordHash(ByVal password As String, ByVal salt As String) As String
+            Dim passwordAndSalt As String = String.Concat(password, salt)
+            Dim hashedPassword As String
+            Dim crypto As New CAPICOM.HashedDataClass
+
+            crypto.Algorithm = CAPICOM.CAPICOM_HASH_ALGORITHM.CAPICOM_HASH_ALGORITHM_SHA1
+            crypto.Hash(passwordAndSalt)
+            hashedPassword = crypto.Value
+
+            crypto = Nothing
+
+            Return hashedPassword
+        End Function
+
+        ' Purpose : Generates a new clear password 
+
+        Public Shared Function GeneratePassword() As String
+            Dim password As String = String.Empty
+            Dim loopIndex As Int16
+            Dim minimumPasswordLength As Int16 = SystemConfiguration.PasswordMinLen
+            Dim randomValue As Int16
+
+            Randomize()
+
+            For loopIndex = 1 To minimumPasswordLength
+                Select Case loopIndex Mod 3
+                    Case 0
+                        'Small letters
+                        randomValue = Int(26 * Rnd()) + 97
+                    Case 1
+                        'Capital letters
+                        randomValue = Int(26 * Rnd()) + 65
+                    Case 2
+                        'numbers (0-9)
+                        randomValue = Int(10 * Rnd()) + 48
+                End Select
+
+                password += Chr(randomValue)
+            Next
+
+            Return password
+        End Function
+
+#End Region
+
+#Region "--- Audit Methods ---"
+
+        ' Purpose : Logs user activity
+
+        Public Shared Function LogActivity(ByVal userID As String,
+                 ByVal language As Int16,
+                 ByVal ipAddress As String,
+                 ByVal appID As Int16,
+                 ByVal actionType As Int16,
+                 ByVal moduleCode As String,
+                 ByVal formSeqNum As Int32,
+                 ByVal webSecurityRole As String,
+                 ByVal entityLevel As Int16,
+                 ByVal entityID As Int32,
+                 ByVal operatorAction As Int16,
+                 ByVal operatorSeverity As Int16,
+                 ByVal errorType As Int16,
+                 ByVal errorCd As String,
+                 ByVal operatorDesc As String,
+                 ByVal machineName As String,
+                 ByVal operatingSys As String,
+                 ByVal browserType As String,
+                 ByVal browserVer As String,
+                 ByVal description As String
+                 ) As Boolean
+
+            Dim retVal As Boolean
+
+            Try
+                retVal = SecurityDB.LogActivity(
+                               userID, language,
+                               ipAddress, appID, actionType,
+                               moduleCode, formSeqNum,
+                               webSecurityRole, entityLevel,
+                               entityID, operatorAction,
+                               operatorSeverity, errorType,
+                               errorCd, operatorDesc,
+                               machineName, operatingSys,
+                               browserType, browserVer,
+                               description)
+
+            Catch in3ex As In3Exception
+                Throw in3ex
+
+            Catch ex As Exception
+                Throw New In3Exception(ClassName & ".LogActivity", ex)
+
+            End Try
+
+            Return retVal
+        End Function
+
+#End Region
+
+#Region "--- User Credentials Class ---"
+
+        ' Purpose :
+        ' History : at 2006-10-11  cr#1272 - self registration implementation
+        '                          userid property was previously not used and uid has value only when user is authenticated. now uid has value for
+        '                          authenticated user while userid is populated for non-authenticated user (identity verified in activation screen)
+
+        Private NotInheritable Class UserCredentials
+            Private _UserID As String
+            Private _Status As Int16
+            Private _ActivationDateTime As Date
+            Private _LogonFailLockoutDateTime As Date
+            Private _LogonFailCount As Int16
+            Private _HashedPassword As String
+            Private _HashSaltValue As String
+            Private _PasswordExpirationDate As Date
+            Private _Language As String
+            Private _LastLogonDateTime As Date
+            Private _SystemDateTime As Date
+            Private _UID As String
+
+            Friend Sub New(ByVal ds As DataSet, ByVal isAuthenticated As Boolean)
+                Me.New(ds.Tables(0).Rows(0), isAuthenticated)
+            End Sub
+
+            Friend Sub New(ByVal row As DataRow, ByVal isAuthenticated As Boolean)
+                _Status = SQLFieldReader.ReadInt16(row, Constant.UserCredentials.Status)
+                _HashedPassword = SQLFieldReader.ReadString(row, Constant.UserCredentials.HashedPassword)
+                _LogonFailCount = SQLFieldReader.ReadInt16(row, Constant.UserCredentials.LogonFailCount)
+                _SystemDateTime = SQLFieldReader.ReadDate(row, Constant.UserCredentials.SystemDateTime)
+
+                If IsDBNull(row(Constant.UserCredentials.ActivationDateTime)) Then
+                    _ActivationDateTime = DateTime.MaxValue
+                Else
+                    _ActivationDateTime = SQLFieldReader.ReadDate(row, Constant.UserCredentials.ActivationDateTime, DateTime.MaxValue)
+                End If
+
+                If IsDBNull(row(Constant.UserCredentials.LogonFailLockoutDateTime)) Then
+                    _LogonFailLockoutDateTime = DateTime.MinValue
+                Else
+                    _LogonFailLockoutDateTime = SQLFieldReader.ReadDate(row, Constant.UserCredentials.LogonFailLockoutDateTime, DateTime.MinValue)
+                End If
+
+                If isAuthenticated Then
+                    If IsDBNull(row(Constant.UserCredentials.PasswordExpirationDate)) Then
+                        _PasswordExpirationDate = DateTime.MinValue
+                    Else
+                        _PasswordExpirationDate = SQLFieldReader.ReadDate(row, Constant.UserCredentials.PasswordExpirationDate, DateTime.MinValue)
+                    End If
+
+                    If IsDBNull(row(Constant.UserCredentials.LastLogonDateTime)) Then
+                        _LastLogonDateTime = DateTime.MinValue
+                    Else
+                        _LastLogonDateTime = SQLFieldReader.ReadDate(row, Constant.UserCredentials.LastLogonDateTime, DateTime.MinValue)
+                    End If
+
+                    _UserID = ""
+                    _UID = SQLFieldReader.ReadString(row, Constant.UserCredentials.UID).Trim()
+                    _HashSaltValue = SQLFieldReader.ReadString(row, Constant.UserCredentials.HashSaltValue)
+                    _Language = SQLFieldReader.ReadString(row, Constant.UserCredentials.Language)
+
+                Else
+                    _PasswordExpirationDate = DateTime.MinValue
+                    _LastLogonDateTime = DateTime.MinValue
+
+                    _UserID = SQLFieldReader.ReadString(row, Constant.UserCredentials.UserID).Trim()
+                    _UID = ""
+                    _HashSaltValue = ""
+                    _Language = ""
+                End If
+            End Sub
+
+            Friend ReadOnly Property Status() As Int16
+                Get
+                    Return _Status
+                End Get
+            End Property
+
+            Friend ReadOnly Property IsLockedOut() As Boolean
+                Get
+                    Return (_LogonFailLockoutDateTime > _SystemDateTime)
+                End Get
+            End Property
+
+            Friend ReadOnly Property UserID() As String
+                Get
+                    Return _UserID
+                End Get
+            End Property
+
+            Friend ReadOnly Property ActivationDateTime() As Date
+                Get
+                    Return _ActivationDateTime
+                End Get
+            End Property
+
+            Friend ReadOnly Property LogonFailCount() As Int16
+                Get
+                    Return _LogonFailCount
+                End Get
+            End Property
+
+            Friend ReadOnly Property HashedPassword() As String
+                Get
+                    Return _HashedPassword
+                End Get
+            End Property
+
+            Friend ReadOnly Property HashSaltValue() As String
+                Get
+                    Return _HashSaltValue
+                End Get
+            End Property
+
+            Friend ReadOnly Property IsPasswordExpired() As Boolean
+                Get
+                    Return _PasswordExpirationDate <= _SystemDateTime
+                End Get
+            End Property
+
+            Friend ReadOnly Property Language() As String
+                Get
+                    Return _Language
+                End Get
+            End Property
+
+            Friend ReadOnly Property LastLogonDateTime() As Date
+                Get
+                    Return _LastLogonDateTime
+                End Get
+            End Property
+
+            Friend ReadOnly Property SystemDateTime() As Date
+                Get
+                    Return _SystemDateTime
+                End Get
+            End Property
+
+            Friend ReadOnly Property UID() As String
+                Get
+                    Return _UID
+                End Get
+            End Property
+
+        End Class
+
+
+
+#End Region
+
+    End Class
+
+End Namespace
+=============
+Public Class SessionProfile
+      'Public UID As Int32
+      Public SessionGUID As String
+      Public UserID As String
+      Public LastLogonDate As Date
+      Public SecurityRole As String
+      Public ContactName As String
+      Public UserHostAddress As String
+      Public UserAgent As String
+      Public TrueClientIP As String
+
+      Public Sub New(ByVal profile As String)
+          Dim profiles() As String = Split(profile, ";")
+
+          SessionGUID = profiles(Constant.UserProfile.SessionGUID)
+          'UserID = profiles(Constant.UserProfile.UserID)
+
+          If UserID Is Nothing Then
+              UserID = profiles(Constant.UserProfile.UserID)
+          End If
+
+          'SecurityRole = profiles(Constant.UserProfile.SecurityRole)
+
+          If SecurityRole Is Nothing Then
+              SecurityRole = profiles(Constant.UserProfile.SecurityRole)
+          End If
+
+          ContactName = profiles(Constant.UserProfile.ContactName)
+          UserHostAddress = profiles(Constant.UserProfile.UserHostAddress)
+          If TrueClientIP <> Nothing Then
+              TrueClientIP = profiles(Constant.UserProfile.TrueClientIP)
+          End If
+
+          Dim userAgentBase64 = profiles(Constant.UserProfile.UserAgent)
+          Dim userAgentBytes = Convert.FromBase64String(userAgentBase64)
+          UserAgent = Encoding.UTF8.GetString(userAgentBytes)
+
+          If IsDBNull(profiles(Constant.UserProfile.LastLogonDate)) Or profiles(Constant.UserProfile.LastLogonDate) = "" Then
+              LastLogonDate = DateTime.MinValue
+          Else
+              LastLogonDate = Date.ParseExact(profiles(Constant.UserProfile.LastLogonDate), Constant.DataFormat.DateTimeFormat, Globalization.CultureInfo.CurrentCulture)
+          End If
+      End Sub
+
+  End Class
+
+===========================
+'-----------------------------------------------------------------------------------------------
+'FILE: BasePage.vb
+'
+'-----------------------------------------------------------------------------------------------
+'COPYRIGHT NOTIFICATION
+'
+'These materials (including without limitation all articles, text, images, logos, software, code 
+'and design) are copyright © 1996-2006 to The Equitable Life Insurance Company of Canada. 
+'All rights reserved. 
+'These materials may not otherwise be copied, transferred, redistributed, rewritten, reproduced in 
+'whole or in part, for commercial or noncommercial purposes or for compensation of any kind, in any 
+'form or medium, without the express written permission of The Equitable Life Insurance Company of 
+'Canada.
+'Any use of these materials is expressly prohibited by law, and may result in severe civil and criminal 
+'penalties. Violators will be prosecuted to the maximum extent possible.
+'
+'If you have questions about these terms, or would like information about licensing materials from 
+'The Equitable Life Insurance Company of Canada, please send an e-mail to legal@equitable.ca.
+'
+'	Equitable Life of Canada
+'	One Westmount Road North
+'	Waterloo,Ontario
+'	Canada, N2J 4C7
+'
+'-----------------------------------------------------------------------------------------------
+'Author:        Allan Tolentino
+'Creation Date: 07/19/2004
+'
+'Purpose:       The base page class from which all BMSWeb pages inherit
+'
+'-----------------------------------------------------------------------------------------------
+'Updates:       Edv     2006-01-10  Added some properties and methods to support user activity
+'                                   logging
+'               Alt     2006-03-06  This class will be moved to the WebControls project
+'               LP      2009-03-09  Defect #256 In Page_PreRender, check frmMain object to see if nothing
+'                                   before adding attributes to it
+'               KS      2011-05-26  Added new method GetMulitpleGroupValidators
+'               LP      2012-01-13  M0669 Add script to get loading image
+'-----------------------------------------------------------------------------------------------
+Imports IN3.BMSWeb.Service.Context
+Imports IN3.BMSWeb.Service.Session
+Imports IN3.BMSWeb.Common
+Imports IN3.BMSWeb.Service.Security
+Imports IN3.Frameworks.ExceptionHandling
+Imports System.Data.SqlClient
+Imports System.Text
+Imports System.Web.Security
+
+Namespace WebUI
+
+    ' Class   : BMS Web Base Page
+    ' Purpose : The base page class from which all bms web pages inherit
+    ' History : at    2004-03-03	Original creation
+    '           Edv   2006-01-10  Added some properties and methods to support user activity logging
+    '           at    2006-03-06  this class will be moved to webcontrols project
+
+    Public Class BasePage
+        Inherits IN3.BMSWeb.WebUI.WebControls.Page
+        Implements WebUI.IFormSecurityContainer, WebUI.ITranslatableContainer, WebUI.IActivity
+
+#Region "--- Server Controls ---"
+
+        Protected frmMain As HtmlForm
+
+#End Region
+
+#Region "--- Fields and Constants ---"
+
+        Private _UserID As String = ""
+        Private _UserRole As String = ""
+        Private _UserLanguageID As Int16
+        Private _UserLanguageCode As String = ""
+        Private _RootUrl As String = ""
+        Private _SkinRootUrl As String = ""
+        Private _SkinUrl As String = ""
+        Private _BaseSkinUrl As String = ""
+        Private _CarrierResourceRootUrl As String = ""
+        Private _CarrierResourceUrl As String = ""
+
+        Private _IsAccessible As Boolean
+        Private _IsTranslatable As Boolean
+        Private _TranslationList As DataTable
+        Private _SecurityAttributeList As DataTable
+
+        Private SessionTimeoutBuffer As Int16 = 3
+
+#End Region
+
+#Region "--- Event Handlers ---"
+
+        ' Purpose : Handles init event
+
+        Private Sub Page_Init(ByVal sender As Object, ByVal e As System.EventArgs) Handles MyBase.Init
+            Dim sessionTimeout As Int16
+
+            ' validate asp net session if it is being utilized
+            If Not Session Is Nothing AndAlso Session.Mode <> SessionState.SessionStateMode.Off Then
+
+                ' if asp net session state has expired, treat it as session timeout
+                If SecurityManager.IsAuthenticated AndAlso Session.IsNewSession Then
+
+                    If Request.Cookies(Constant.CookieName.LegacyTimeoutIndicator) Is Nothing Then
+                        ' First time coming into the legacy app so this is ok
+                        Response.Cookies.Add(New HttpCookie(Constant.CookieName.LegacyTimeoutIndicator, "1"))
+                    Else
+                        ' Cookie exists but session is new so that means session was lost (ie app pool recycled) so we can't recover
+                        SecurityManager.SignOut(SecurityManager.SessionProfile.UserID, ContextManager.UserSiteContext.LanguageID)
+                        FormUtility.DisplaySignoutMessage(Constant.FormID.WUSMsgSessionTimedOut)
+                        Return
+                    End If
+
+                End If
+
+                If Request.Cookies(Constant.CookieName.LegacyTimeoutIndicator) Is Nothing Then
+                    ' Ensure this cookie always exists if we get this far
+                    Response.Cookies.Add(New HttpCookie(Constant.CookieName.LegacyTimeoutIndicator, "1"))
+                End If
+
+                ' make sure session timeout minutes is less than asp net session timeout
+                sessionTimeout = SystemConfiguration.SessionTimeoutMins
+                If Session.Timeout < sessionTimeout Then
+                    Session.Timeout = sessionTimeout + SessionTimeoutBuffer
+                End If
+
+            End If
+
+            ' load standard page properties
+            _RootUrl = Page.ResolveUrl("~/")
+            BaseLibrary.GetUserContext(_UserID, _UserRole, _UserLanguageID, _UserLanguageCode)
+            BaseLibrary.GetResourceUrl(Me.ModuleCode, Me.SkinModuleCode, _RootUrl, _SkinRootUrl, _SkinUrl, _BaseSkinUrl, _CarrierResourceRootUrl, _CarrierResourceUrl)
+        End Sub
+
+        ' Purpose : Handles load event
+
+        Private Sub Page_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
+            Try
+                'CR#44
+                Dim ds As DataSet
+                If UserSession.Main.PolicyID <> 0 And (Me.ModuleCode = Constant.ModuleCode.PlanAdmin Or Me.ModuleCode = Constant.ModuleCode.Producer) Then
+                    ds = SecurityManager.UpdateUserIdAndRoles(Me.UserID, UserSession.Main.PolicyID, Me.ModuleCode)
+                    If Not ds Is Nothing And ds.Tables(0).Rows.Count > 0 Then
+                        Me.UserID = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), "USERID")
+                        Me.UserRole = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), "WEBSECROLECODE")
+                        SecurityManager.SessionProfile.UserID = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), "USERID")
+                        SecurityManager.SessionProfile.SecurityRole = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), "WEBSECROLECODE")
+
+                        'Code for changing UserId and adding it to the cookie
+                        Dim authTicket As FormsAuthenticationTicket = Nothing
+                        Dim authCookie = HttpContext.Current.Request.Cookies(FormsAuthentication.FormsCookieName)
+
+                        If Not authCookie Is Nothing Then
+                            authTicket = FormsAuthentication.Decrypt(authCookie.Value)
+                        End If
+
+                        'userData stored in the ticket is a pipe delimited string containing roles and profile
+                        Dim userData() As String = Split(authTicket.UserData, "|")
+
+                        'user roles is stored as semicolon delimited string
+                        Dim roles() As String = Split(userData(Constant.UserData.UserRoles), ";")
+
+                        'user profile is stored as semicolon delimited string. pass it to the UserProfile constructor
+                        Dim userProfile As New BMSWebPrincipal.SessionProfile(userData(Constant.UserData.UserProfile))
+                        userProfile.UserID = SQLFieldReader.ReadString(ds.Tables(0).Rows(0), "USERID")
+                        Dim userProfile1 As New BMSWebPrincipal.SessionProfile(userData(Constant.UserData.UserProfile))
+
+                        Dim id As New FormsIdentity(authTicket)
+
+                        'create a custom principal and store it in the user context object
+                        Dim principal As New BMSWebPrincipal(id, roles, userProfile1)
+
+                        HttpContext.Current.User = principal
+
+                    End If
+                End If
+
+                If Me.IsPublic Then
+                    _IsAccessible = True
+                Else
+                    _IsAccessible = BaseLibrary.GetSecurityAttributeList(Me, _SecurityAttributeList)
+                End If
+                _IsTranslatable = BaseLibrary.GetTranslationList(Me, _TranslationList)
+            Catch ex As Exception
+                LogActivity(ex)
+                FormUtility.Publish(Me.GetType.ToString(), ex, Constant.FormID.WUSMsgTechnicalDifficulties, False)
+            End Try
+
+            If Not Me.IsAccessible Then
+                SetFormLockDown()
+            End If
+        End Sub
+
+        Sub LogActivity(ByVal ex As Exception)
+
+            If TypeOf (ex) Is In3Exception Then
+
+                If TypeOf (ex.InnerException) Is SqlException Then
+                    HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Database
+                End If
+
+                HttpContext.Current.Items(Constant.ActivityContext.Description) = ex.InnerException.Message & " at " & ex.InnerException.Source
+
+            ElseIf TypeOf (ex) Is In3AppException Then
+
+                If TypeOf (ex.InnerException) Is SqlException Then
+                    HttpContext.Current.Items(Constant.ActivityContext.ReqErrorType) = Constant.RequestErrorType.Database
+                End If
+
+                HttpContext.Current.Items(Constant.ActivityContext.Description) = ex.InnerException.Message & " at " & ex.InnerException.Source
+                HttpContext.Current.Items(Constant.ActivityContext.ReqErrorCode) = DirectCast(ex, In3AppException).Code
+
+            Else
+
+                HttpContext.Current.Items(Constant.ActivityContext.Description) = ex.Message
+
+            End If
+            LogActivity()
+        End Sub
+
+        Sub LogActivity()
+
+            Dim entityID As Int32
+            Dim actionOpStatus, actionOpSeverity, errorType As Int16
+            Dim errorCode, opDesc, description As String
+            Dim userID As String = String.Empty
+            Dim role As String = String.Empty
+            Dim languageCode As String = String.Empty
+            Dim languageID As Int16
+
+            Select Case Me.EntityLevel
+                Case Constant.EntityLevel.Certificate
+                    entityID = UserSession.Main.CertificateID
+                Case Constant.EntityLevel.Policy
+                    entityID = UserSession.Main.PolicyID
+                Case Constant.EntityLevel.CertificateBenefit
+                Case Constant.EntityLevel.Class
+                Case Constant.EntityLevel.ClassBen
+                Case Constant.EntityLevel.ClassPlan
+                Case Constant.EntityLevel.Coverage
+                Case Constant.EntityLevel.CoveredLives
+                Case Constant.EntityLevel.Division
+            End Select
+
+            actionOpStatus = ContextItem.GetInt16(Constant.ActivityContext.ReqActionOpStatus)
+            actionOpSeverity = ContextItem.GetInt16(Constant.ActivityContext.ReqActionOpSeverity)
+            errorType = ContextItem.GetInt16(Constant.ActivityContext.ReqErrorType)
+            errorCode = ContextItem.GetString(Constant.ActivityContext.ReqErrorCode)
+            opDesc = ContextItem.GetString(Constant.ActivityContext.ReqOpDesc)
+            description = ContextItem.GetString(Constant.ActivityContext.Description)
+
+            BaseLibrary.GetUserContext(userID, role, languageID, languageCode)
+
+            'edv 06/27/2006 - If user name is not empty then set the userID to the querystring value. This is added specifically for Forgot Password page.
+            If QueryString.GetString(Constant.QueryStringKey.UserName) <> "" Then
+                userID = QueryString.GetString(Constant.QueryStringKey.UserName)
+            End If
+
+            SecurityManager.LogActivity(
+                  userID,
+                  languageID,
+                  Request.UserHostAddress,
+                  Constant.Application.ID,
+                  Me.RequestType,
+                  Me.ModuleCode,
+                  Me.FormID,
+                  role,
+                  Me.EntityLevel,
+                  entityID,
+                  actionOpStatus,
+                  actionOpSeverity,
+                  errorType,
+                  errorCode,
+                  opDesc,
+                  Server.MachineName,
+                  Request.Browser.Platform,
+                  Request.Browser.Type,
+                  Request.Browser.Version,
+                  description
+                  )
+        End Sub
+
+        ' Purpose : Handles Prerender event
+
+        Private Sub Page_PreRender(ByVal sender As Object, ByVal e As System.EventArgs) Handles MyBase.PreRender
+            Dim helpUrl As String
+
+            ' LP 2009-03-09  Defect #256
+            If Not frmMain Is Nothing Then
+                frmMain.Attributes.Add("onSubmit", "return disableSubmit('')")
+            End If
+
+            ' add help link if help id is available
+            If Me.HelpID.Length > 0 Then
+                helpUrl = ResolveHelpUrl(Me.HelpID)
+                ' LP 2009-03-09  Defect #256
+                If Not frmMain Is Nothing Then
+                    frmMain.Attributes.Add(Constant.ElementAttributeName.HelpID, helpUrl)
+                End If
+            End If
+
+            If Me.PostBackMessage.Length > 0 Then
+                ' LP 2009-03-09  Defect #256
+                If Not frmMain Is Nothing Then
+                    frmMain.Attributes.Add(Constant.ElementAttributeName.PostBackMessage, HttpUtility.HtmlEncode(Me.PostBackMessage))
+                End If
+            End If
+
+            If SystemConfiguration.ActivityLog.ActivityLogLevel <> 0 AndAlso
+               Me.ActivityLogLevel <> 0 AndAlso
+               SystemConfiguration.ActivityLog.ActivityLogLevel >= Me.ActivityLogLevel Then
+
+                'edv: this code starts a new thread and executes LogActivity method. Calling a method
+                '     asynchronously in this manner is expensive as it involves creating and disposing of a thread.
+                '     We decided to use synchronous call to avoid that situation. 
+                'Dim ActivityThread As New System.Threading.Thread(AddressOf LogActivity)
+                'ActivityThread.Start()
+                Try
+                    LogActivity()
+                Catch ex As Exception
+                End Try
+            End If
+
+            Response.Cache.SetCacheability(HttpCacheability.NoCache)
+            'Response.CacheControl = "no-cache"
+
+        End Sub
+
+        ' Purpose : Handles Unload event
+
+        Private Sub Page_Unload(ByVal sender As Object, ByVal e As System.EventArgs) Handles MyBase.Unload
+            SQLFieldReader.Release(_TranslationList)
+            SQLFieldReader.Release(_SecurityAttributeList)
+        End Sub
+
+#End Region
+
+#Region "--- Methods ---"
+
+        ' Purpose : 
+
+        Protected Overridable Sub SetFormSecurity() Implements WebUI.IFormSecurityContainer.SetFormSecurity
+            If Not Me.IsPublic Then
+                BaseLibrary.SetContainerSecurity(Me, Me.SecurityAttributeList)
+            End If
+        End Sub
+
+        ' Purpose : 
+
+        Protected Overridable Sub SetFormLockDown() Implements WebUI.IFormSecurityContainer.SetFormLockDown
+            FormUtility.DisplayMessage(Constant.FormID.WUSMsgDataAccessDenied)
+        End Sub
+
+        ' Purpose : 
+
+        Protected Overridable Sub Translate() Implements WebUI.ITranslatableContainer.Translate
+
+        End Sub
+
+        ' Purpose : Returns the url path of the specified help code
+
+        Protected Function ResolveHelpUrl(ByVal help As String) As String
+            With Me
+                Return BaseLibrary.ResolveHelpUrl(.Request.Url.Authority, .RootUrl, .UserLanguageCode, .ModuleCode, help)
+            End With
+        End Function
+
+        ' Purpose : Returns validators that belong to the list of validation groups specified
+
+        Protected Function GetMultipleGroupValidators(ByVal ParamArray validationGroups As String()) As ValidatorCollection
+            Dim validators As ValidatorCollection = New ValidatorCollection()
+            For Each validationGroup As String In validationGroups
+                Dim groupValidators As ValidatorCollection = Page.GetValidators(validationGroup)
+                For Each groupValidator As IValidator In groupValidators
+                    validators.Add(groupValidator)
+                Next
+            Next
+            Return validators
+        End Function
+
+#End Region
+
+#Region "--- Properties ---"
+
+#Region "--- Activity Properties ---"
+
+        ' Purpose : Returns the Entity Level.
+        '           Must be overridden by the inheriting page
+        '           This property is required for activity logging
+
+        Friend Overridable ReadOnly Property EntityLevel() As Int16 Implements WebUI.IActivity.EntityLevel
+            Get
+                Return 0
+            End Get
+        End Property
+
+        ' Purpose : Returns the Activity Log Level.
+        '           Must be overridden by the inheriting page
+        '           This property is required for activity logging
+
+        Friend Overridable ReadOnly Property ActivityLogLevel() As Int16 Implements WebUI.IActivity.ActivityLogLevel
+            Get
+                Return 0
+            End Get
+        End Property
+
+        ' Purpose : Returns the User Request Type.
+        '           Must be overridden by the inheriting page
+        '           This property is required for activity logging
+
+        Friend Overridable ReadOnly Property RequestType() As Int16 Implements WebUI.IActivity.RequestType
+            Get
+                Return 0
+            End Get
+        End Property
+
+#End Region
+
+#Region "--- Form Properties ---"
+
+        ' Purpose : Gets the module code.
+        '           Must be overridden by the inheriting page
+        '           This property is required when applying security and language translation
+
+        Public Overridable ReadOnly Property ModuleCode() As String Implements WebUI.IFormSecurityContainer.ModuleCode, WebUI.ITranslatableContainer.ModuleCode
+            Get
+                'edv 11/12/2004: return the site context current module
+                'Return ""
+                'Return ContextManager.UserSiteContext.CurrentModule
+                Return UserSession.GetString(Constant.SiteSession.CurrentModule)
+            End Get
+        End Property
+
+        ' Purpose : Gets the module code to use for skin. override this property
+        '           to support variable skinning for inheriting page
+
+        Public Overridable ReadOnly Property SkinModuleCode() As String
+            Get
+                Return ModuleCode
+            End Get
+        End Property
+
+        ' Purpose : Gets the form id. 
+        '           Must be overridden by the inheriting page
+        '           This property is required when applying security and language translation
+
+        Public Overridable ReadOnly Property FormID() As Int32 Implements WebUI.IFormSecurityContainer.FormID, WebUI.ITranslatableContainer.FormID
+            Get
+                Return 0
+            End Get
+        End Property
+
+        ' Purpose : Gets the help id. default to form id
+        '           Must be overridden by the inheriting page
+
+        Public Overridable ReadOnly Property HelpID() As String
+            Get
+                Return ""
+            End Get
+        End Property
+
+        ' Purpose : Gets or sets the current languange code setting of the page
+
+        Protected Property FormLanguageID() As Int16 Implements WebUI.ITranslatableContainer.FormLanguageID
+            Get
+                Return ViewState.Item(Constant.ViewStateKey.LanguageID)
+            End Get
+
+            Set(ByVal value As Int16)
+                ViewState.Add(Constant.ViewStateKey.LanguageID, value)
+            End Set
+        End Property
+
+        ' Purpose : Returns a reference to the main form
+
+        Protected ReadOnly Property MainForm() As HtmlForm
+            Get
+                Return frmMain
+            End Get
+        End Property
+
+        ' Purpose : Returns the message to display on postback (eg "processing...")
+
+        Public Overridable ReadOnly Property PostBackMessage() As String
+            Get
+                Return ""
+            End Get
+        End Property
+
+#End Region
+
+#Region "--- Context Properties ---"
+
+        ' Purpose : Gets the Sets UserId of the current user
+
+        Protected Property UserID() As String Implements WebUI.IFormSecurityContainer.UserID, WebUI.ITranslatableContainer.UserID
+            Get
+                Return _UserID
+            End Get
+            Set(value As String)
+                _UserID = value
+            End Set
+        End Property
+
+        ' Purpose : Gets and Sets the UserRole of the current user
+
+        Protected Property UserRole() As String Implements WebUI.IFormSecurityContainer.UserRole
+            Get
+                Return _UserRole
+            End Get
+            Set(value As String)
+                _UserRole = value
+            End Set
+        End Property
+
+        ' Pupose : Gets the user's language id
+
+        Public ReadOnly Property UserLanguageID() As Int16 Implements WebUI.IFormSecurityContainer.UserLanguageID, WebUI.ITranslatableContainer.UserLanguageID
+            Get
+                Return _UserLanguageID
+            End Get
+        End Property
+
+        ' Pupose : Gets the user's language code
+
+        Public ReadOnly Property UserLanguageCode() As String Implements WebUI.ITranslatableContainer.UserLanguageCode
+            Get
+                Return _UserLanguageCode
+            End Get
+        End Property
+
+#End Region
+
+#Region "--- Skin and Resource Url ---"
+
+        ' Purpose : Gets the root url
+
+        Public ReadOnly Property RootUrl() As String
+            Get
+                Return _RootUrl
+            End Get
+        End Property
+
+        ' Purpose : Gets the skins root url
+
+        Public Overrides ReadOnly Property SkinRootUrl() As String
+            Get
+                Return _SkinRootUrl
+            End Get
+        End Property
+
+        ' Purpose : Gets the skins root url
+
+        Public Overrides ReadOnly Property SkinUrl() As String
+            Get
+                Return _SkinUrl
+            End Get
+        End Property
+
+        ' Purpose : Gets the base skins root url
+
+        Public Overrides ReadOnly Property BaseSkinUrl() As String
+            Get
+                Return _BaseSkinUrl
+            End Get
+        End Property
+
+        ' Purpose : Gets the carrier specific resource root url
+
+        Public ReadOnly Property CarrierResourceRootUrl() As String
+            Get
+                Return _CarrierResourceRootUrl
+            End Get
+        End Property
+
+        ' Purpose : Gets the carrier specific resource url
+
+        Public ReadOnly Property CarrierResourceUrl() As String
+            Get
+                Return _CarrierResourceUrl
+            End Get
+        End Property
+
+#End Region
+
+#Region "--- Control Flags ---"
+
+        ' Purpose : Gets whether or not to allow update of current module
+
+        Protected Overridable ReadOnly Property AllowModuleUpdate() As Boolean
+            Get
+                Return False
+            End Get
+        End Property
+
+        ' Purpose : Gets whether or not to force translation for the page
+
+        Protected Overridable ReadOnly Property AlwaysTranslate() As Boolean Implements WebUI.ITranslatableContainer.AlwaysTranslate
+            Get
+                Return False
+            End Get
+        End Property
+
+#End Region
+
+#Region "--- Security and Language ---"
+
+        ' Purpose : 
+
+        Protected Friend ReadOnly Property SecurityAttributeList() As DataTable Implements IFormSecurityContainer.SecurityAttributeList
+            Get
+                Return _SecurityAttributeList
+            End Get
+        End Property
+
+        ' Purpose : 
+
+        Protected Friend ReadOnly Property TranslationList() As DataTable Implements ITranslatableContainer.TranslationList
+            Get
+                Return _TranslationList
+            End Get
+        End Property
+
+        ' Purpose : 
+
+        Protected ReadOnly Property IsAccessible() As Boolean Implements IFormSecurityContainer.IsAccessible
+            Get
+                Return _IsAccessible
+            End Get
+        End Property
+
+        ' Purpose : 
+
+        Protected ReadOnly Property IsTranslatable() As Boolean Implements ITranslatableContainer.IsTranslatable
+            Get
+                Return _IsTranslatable
+            End Get
+        End Property
+
+        ' Purpose : 
+
+        Protected Overridable ReadOnly Property IsPublic() As Boolean
+            Get
+                Return False
+            End Get
+        End Property
+
+#End Region
+
+#End Region
+
+    End Class
+
+End Namespace
+
+================================
+
+
+
