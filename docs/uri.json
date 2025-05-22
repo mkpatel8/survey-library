@@ -41,3 +41,40 @@
 }
 
 
+Excellent additions! I've updated the analysis to include all the new requirements and strategic considerations. Here are the key changes:
+
+## **Major Updates Added:**
+
+### **1. Comprehensive Technology Upgrades:**
+- **Angular:** 6.1.5 → 15 (minimally acceptable, not bleeding edge)
+- **.NET:** 2.1 → .NET 6 (stable LTS, not latest)
+- **Bank Validation Service:** Legacy → .NET 6 alignment
+- **Containerization:** APIs in containers, deployed to App Service
+- **APIM:** Route all backend communication through API Management
+
+### **2. Security & Authentication:**
+- **Okta Integration:** For API security (with public PDF endpoint option)
+- **TLS 1.2:** Enhanced security compliance
+- **SNYK Vulnerabilities:** Focus on high/critical issues
+
+### **3. Strategic Long-term Vision:**
+- **Maintenance Mode:** Keep C2G stable with minimal effort
+- **EBS Migration Prep:** Containerized architecture facilitates future migration
+- **Gradual Sunsetting:** Incremental feature migration to EBS
+- **Cost Optimization:** Eliminate redundancies as features move
+
+### **4. Realistic Timeline & Costs:**
+- **Option 1:** 420 hours (14 weeks) - still the best choice
+- **Option 2:** 780 hours (26 weeks) - terrible ROI (8-15 years)
+- **Additional Costs:** APIM licensing (~$500-1000 CAD/year)
+
+## **Strengthened Recommendation:**
+
+**Option 1 is even more clearly the right choice** because:
+✅ **Balanced modernization** - not bleeding edge, not obsolete  
+✅ **Infrastructure ready for EBS migration** - containerized APIs, APIM  
+✅ **Security compliance** - Okta, TLS 1.2, vulnerability fixes  
+✅ **Reasonable effort** - 420 hours for comprehensive modernization  
+✅ **Strategic alignment** - prepares for gradual EBS migration  
+
+The additional requirements make this a proper infrastructure modernization project that sets C2G up for success in the long-term EBS migration strategy.
